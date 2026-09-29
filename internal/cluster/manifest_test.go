@@ -41,6 +41,8 @@ func TestParseManifest(t *testing.T) {
 	want := []liveness.Ref{
 		{APIVersion: "v1", Kind: "Service", Namespace: "prod", Name: "web"},
 		{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "other", Name: "web"},
+		// a name Kubernetes picks later must not vanish from the checks
+		{APIVersion: "batch/v1", Kind: "Job", Namespace: "prod", GenerateName: "job-"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseManifest = %+v\nwant %+v", got, want)
@@ -91,10 +93,10 @@ func TestManifestRefsIncludesHooksAndDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("refs = %+v, want 2 manifest objects and 1 hook", got)
+	if len(got) != 4 {
+		t.Fatalf("refs = %+v, want 3 manifest objects (one with a generated name) and 1 hook", got)
 	}
-	last := got[2]
+	last := got[3]
 	if last.Kind != "Job" || last.Name != "web-migrate" || !last.Hook || last.Namespace != "prod" {
 		t.Errorf("hook ref = %+v", last)
 	}

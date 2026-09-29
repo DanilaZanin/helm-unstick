@@ -61,6 +61,26 @@ type Plan struct {
 type Context struct {
 	Tool  string   // command prefix: helm-unstick, helm unstick or kubectl unstick
 	Flags []string // extra flags to repeat, for example "--older-than 15m"
+	// HelmFlags select the cluster for the plain helm commands (--kube-context, --kubeconfig).
+	HelmFlags []string
+	// Driver is the Helm storage driver; helm commands get HELM_DRIVER=... unless it is the default.
+	Driver string
+	// ToRevision is the rollback target the user chose with --to-revision, 0 when none.
+	ToRevision int
+}
+
+// helmCommand spells a plain helm command so it acts on the same cluster and storage.
+func (c Context) helmCommand(args ...string) string {
+	var parts []string
+	switch c.Driver {
+	case "", "secret", "secrets":
+	default:
+		parts = append(parts, "HELM_DRIVER="+c.Driver)
+	}
+	parts = append(parts, "helm")
+	parts = append(parts, args...)
+	parts = append(parts, c.HelmFlags...)
+	return strings.Join(parts, " ")
 }
 
 func (c Context) fixCommand(s *model.Stuck, extra ...string) string {
@@ -72,8 +92,11 @@ func (c Context) fixCommand(s *model.Stuck, extra ...string) string {
 
 // Build creates the plan. mode only matters when the release has no rollback target.
 func Build(s *model.Stuck, mode FirstInstall, ctx Context) Plan {
+	if ctx.ToRevision > 0 {
+		return rollbackPlan(s, ctx, ctx.ToRevision)
+	}
 	if s.HasRollbackTarget() {
-		return rollbackPlan(s, ctx)
+		return rollbackPlan(s, ctx, s.Target.Number)
 	}
 	switch mode {
 	case FirstInstallMarkFailed:
@@ -93,16 +116,21 @@ func pendingNumbers(s *model.Stuck) string {
 	return strings.Join(nums, ", ")
 }
 
-func rollbackPlan(s *model.Stuck, ctx Context) Plan {
-	p := Plan{Action: ActionRollback, RollbackTo: s.Target.Number}
-	p.Summary = fmt.Sprintf("Roll back to revision %d, the newest deployed revision.", s.Target.Number)
+func rollbackPlan(s *model.Stuck, ctx Context, target int) Plan {
+	p := Plan{Action: ActionRollback, RollbackTo: target}
+	p.Summary = fmt.Sprintf("Roll back to revision %d, the newest deployed revision.", target)
+	fixArgs := []string(nil)
+	if ctx.ToRevision > 0 {
+		p.Summary = fmt.Sprintf("Roll back to revision %d, the revision you chose.", target)
+		fixArgs = []string{fmt.Sprintf("--to-revision %d", target)}
+	}
 	p.Steps = []string{
-		fmt.Sprintf("Roll back release %q to revision %d. Helm records the result as revision %d.", s.Release, s.Target.Number, s.NextRevision()),
+		fmt.Sprintf("Roll back release %q to revision %d. Helm records the result as revision %d.", s.Release, target, s.NextRevision()),
 		fmt.Sprintf("Mark any of the pending revisions (%s) that the rollback leaves behind as failed, so the history stops showing an operation in progress.", pendingNumbers(s)),
 	}
 	p.Commands = []Command{
-		{Note: "recover with helm-unstick", Line: ctx.fixCommand(s)},
-		{Note: "the rollback step alone, by hand", Line: fmt.Sprintf("helm rollback %s %d -n %s", s.Release, s.Target.Number, s.Namespace)},
+		{Note: "recover with helm-unstick", Line: ctx.fixCommand(s, fixArgs...)},
+		{Note: "the rollback step alone, by hand", Line: ctx.helmCommand("rollback", s.Release, fmt.Sprint(target), "-n", s.Namespace)},
 	}
 	return p
 }
@@ -134,26 +162,40 @@ func uninstallPlan(s *model.Stuck, ctx Context) Plan {
 	}
 	p.Commands = []Command{
 		{Note: "recover with helm-unstick", Line: ctx.fixCommand(s, "--first-install=uninstall")},
-		{Note: "the same by hand", Line: fmt.Sprintf("helm uninstall %s -n %s", s.Release, s.Namespace)},
+		{Note: "the same by hand", Line: ctx.helmCommand("uninstall", s.Release, "-n", s.Namespace)},
 	}
 	return p
 }
 
 func choosePlan(s *model.Stuck, ctx Context) Plan {
 	p := Plan{Action: ActionChoose}
-	if s.Pending.Status == model.StatusPendingInstall {
+	var cmds []Command
+	switch {
+	case s.Pending.Status == model.StatusPendingInstall:
 		p.Summary = fmt.Sprintf("Revision %d is an interrupted first install, so there is nothing to roll back to.", s.Pending.Number)
-	} else {
+	case s.Superseded != nil:
+		p.Summary = fmt.Sprintf(
+			"The history has no deployed revision, but revision %d is superseded. Helm marks the old revision superseded before it stores the new deployed one, so an operation interrupted between the two writes looks like this. Revision %d was probably the last good state, but nothing proves it.",
+			s.Superseded.Number, s.Superseded.Number)
+		p.Steps = append(p.Steps, fmt.Sprintf("rollback: return to revision %d. Use it only if you know revision %d was the state you want.", s.Superseded.Number, s.Superseded.Number))
+		cmds = append(cmds, Command{
+			Note: fmt.Sprintf("roll back to superseded revision %d", s.Superseded.Number),
+			Line: ctx.fixCommand(s, fmt.Sprintf("--to-revision %d", s.Superseded.Number)),
+		})
+	default:
 		p.Summary = "The history has no deployed revision, so there is nothing to roll back to."
 	}
-	p.Summary += " Nothing is changed until you pick one of two ways out."
-	p.Steps = []string{
+	p.Summary += " Nothing is changed until you pick a way out."
+	p.Steps = append(p.Steps,
 		fmt.Sprintf("mark-failed: set revision %d to failed and keep whatever the operation created. The next helm upgrade --install proceeds.", s.Pending.Number),
-		"uninstall: remove the release and everything Helm created for it, then install again from scratch.",
-	}
-	p.Commands = []Command{
-		{Note: "keep the created resources", Line: ctx.fixCommand(s, "--first-install=mark-failed")},
-		{Note: "start over", Line: ctx.fixCommand(s, "--first-install=uninstall")},
+		"uninstall: remove the release and everything Helm created for it, then install again from scratch.")
+	cmds = append(cmds,
+		Command{Note: "keep the created resources", Line: ctx.fixCommand(s, "--first-install=mark-failed")},
+		Command{Note: "start over", Line: ctx.fixCommand(s, "--first-install=uninstall")})
+	p.Commands = cmds
+	if older := len(s.Revisions) - 1; older > 0 {
+		p.Warnings = append(p.Warnings, fmt.Sprintf(
+			"uninstall deletes all %d earlier revisions of the history together with the resources. Prefer rollback or mark-failed for a release that has a history.", older))
 	}
 	return p
 }
@@ -168,6 +210,9 @@ func Recommend(s *model.Stuck, v verdict.Verdict) string {
 	}
 	if s.HasRollbackTarget() {
 		return fmt.Sprintf("fix: roll back to revision %d", s.Target.Number)
+	}
+	if s.Superseded != nil {
+		return fmt.Sprintf("fix: choose --to-revision %d, --first-install=mark-failed or uninstall", s.Superseded.Number)
 	}
 	return "fix: choose --first-install=mark-failed or uninstall"
 }

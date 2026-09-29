@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call: # the release workflow runs this whole file on the tagged commit before it publishes
 
 permissions:
   contents: read

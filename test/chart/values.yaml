@@ -5,3 +5,10 @@ readinessDelay: 0
 rollout: "1"
 
 image: busybox:1.36
+
+# Deployment progressDeadlineSeconds; 0 keeps the Kubernetes default.
+progressDeadline: 0
+
+# Adds a LoadBalancer Service. kind has no load balancer, so it never gets an ingress address
+# and helm --wait keeps waiting for it.
+loadBalancer: false

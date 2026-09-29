@@ -10,7 +10,7 @@ import (
 	"github.com/DanilaZanin/helm-unstick/internal/render"
 )
 
-const explainHelp = `Usage: explain RELEASE [-n NAMESPACE] [--older-than 10m]
+const explainHelp = `Usage: explain RELEASE [-n NAMESPACE] [--older-than 10m] [--helm-timeout 5m]
 
 Prints why the release is stuck, the liveness verdict with its reasons, the recovery
 plan with exact commands, and the revision history. Changes nothing.
@@ -18,10 +18,9 @@ plan with exact commands, and the revision history. Changes nothing.
 
 func runExplain(ctx context.Context, args []string, env Env, newBackend Factory) int {
 	var c commonFlags
-	older := newDurationFlag(DefaultOlderThan)
 	fs := newFlagSet("explain")
 	c.bind(fs)
-	fs.Var(older, "older-than", "")
+	older, helmTimeout := bindThresholds(fs)
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return parseFailure(err, env, "explain", explainHelp)
@@ -49,8 +48,8 @@ func runExplain(ctx context.Context, args []string, env Env, newBackend Factory)
 		notStuck(env, h)
 		return ExitOK
 	}
-	a := assess(ctx, be, s, older.d, env.Now())
-	pctx := planContext(env, passthrough(fs, "older-than", "kube-context", "kubeconfig", "driver"))
+	a := assess(ctx, be, s, thresholds{olderThan: older.d, helmTimeout: helmTimeout.d}, env.Now())
+	pctx := planContext(env, fs, c.Global)
 	render.Explain(env.Stdout, render.Report{
 		Stuck: s, Age: a.Age, OlderThan: older.d, Verdict: a.Result,
 		Plan: plan.Build(s, plan.FirstInstallNone, pctx),

@@ -11,6 +11,7 @@
 #   UNSTICK                  binary under test (default: bin/helm-unstick, build it with make build)
 #   E2E_USE_CURRENT_CONTEXT  1 = use the current kube context, do not create or delete a cluster
 #   E2E_CLUSTER              kind cluster name (default: helm-unstick-e2e)
+#   E2E_ONLY                 space-separated scenario names to run (default: all), for example "live_wait plugin"
 #   KEEP_CLUSTER             1 = keep the kind cluster afterwards
 set -euo pipefail
 
@@ -117,6 +118,9 @@ if command -v kind >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 &&
   fi
 fi
 
+HELM_MAJOR=$("$HELM" version --short 2>&1 | sed -n 's/^v\([0-9]*\)\..*/\1/p' | head -n1)
+HELM_MAJOR=${HELM_MAJOR:-unknown}
+
 log "environment"
 info "helm:      $("$HELM" version --short 2>&1)"
 info "unstick:   $("$UNSTICK" version)"
@@ -195,6 +199,11 @@ scenario_interrupted_upgrade() {
   expect_helm_blocked "$ns" "$rel"
 
   kubectl -n "$ns" rollout status "deploy/$rel" --timeout=180s >/dev/null
+  # printed manual commands must keep the cluster selection
+  local ctx
+  ctx=$(kubectl config current-context)
+  run "$UNSTICK" explain "$rel" -n "$ns" --older-than 0s --kube-context "$ctx"
+  expect_out "helm rollback $rel 1 -n $ns --kube-context $ctx" "explain with --kube-context"
   scan_stuck "$ns"
   [[ "$VERDICT" == stale ]] || die "scenario 1: expected verdict stale, got: $OUT"
   expect_rc 2 "scan exit code for a stuck release"
@@ -335,18 +344,156 @@ scenario_interrupted_rollback() {
   drop_namespace "$ns"
 }
 
+# ---------------------------------------------------------------- scenario 5
+
+# Helm 3 --wait keeps waiting after a Deployment hits ProgressDeadlineExceeded. While that helm
+# is alive fix must refuse; once it is dead and its own timeout has passed, fix recovers and
+# leaves exactly one deployed revision. Helm 4 stops at the deadline, so there is no live helm to protect.
+scenario_live_wait_after_deadline() {
+  local ns=e2e-s5 rel=web
+  log "scenario 5: live helm --wait past the progress deadline"
+  if [[ $HELM_MAJOR != 3 ]]; then
+    info "skipped: Helm $HELM_MAJOR stops waiting at ProgressDeadlineExceeded"
+    return 0
+  fi
+  new_namespace "$ns"
+  "$HELM" install "$rel" "$CHART" -n "$ns" --wait --timeout 3m --set rollout=1 >/dev/null
+
+  start_bg "$HELM" upgrade "$rel" "$CHART" -n "$ns" --wait --timeout 3m --set rollout=2 --set readinessDelay=3600 --set progressDeadline=10
+  wait_status "$ns" "$rel" pending-upgrade 60
+  wait_rollout_annotation "$ns" "$rel" 2
+  wait_for 90 "the progress deadline to be exceeded" bash -c \
+    "kubectl -n '$ns' get deploy '$rel' -o jsonpath='{.status.conditions[?(@.type==\"Progressing\")].reason}' | grep -q ProgressDeadlineExceeded"
+  kill -0 "$BG_PID" 2>/dev/null || die "scenario 5: helm exited at the progress deadline; it should keep waiting"
+  info "the Deployment is past its progress deadline and helm is still waiting"
+
+  scan_stuck "$ns"
+  [[ "$VERDICT" == possibly-running ]] || die "scenario 5: expected possibly-running while helm is alive, got: $OUT"
+  grep -qF "progress deadline exceeded" <<<"$OUT" || die "scenario 5: the verdict must name the deadline: $OUT"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 3m --yes
+  expect_rc 3 "fix while helm --wait is alive past the deadline"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 3m --yes --force-unknown
+  expect_rc 3 "fix --force-unknown while helm --wait is alive"
+  [[ "$(latest_status "$ns" "$rel")" == pending-upgrade ]] || die "fix touched a release whose helm is alive"
+  pass "fix refuses with exit 3 while helm is alive past the progress deadline"
+
+  kill_bg
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 3m --yes
+  expect_rc 3 "fix right after helm died, inside its timeout"
+  pass "the record is still protected until the helm timeout has passed"
+
+  # helm-timeout 5s + 1m grace: the record must be older than 65s
+  wait_for 150 "the record to outlive the helm timeout" bash -c \
+    "'$UNSTICK' scan -n '$ns' --older-than 0s --helm-timeout 5s -o json | jq -e '.[0].verdict == \"stale\"'"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 5s --yes
+  expect_rc 0 "fix after the helm timeout"
+  [[ "$(latest_status "$ns" "$rel")" == deployed ]] || die "release is not deployed after fix"
+  local deployed
+  deployed=$("$HELM" history "$rel" -n "$ns" -o json | jq '[.[] | select(.status == "deployed")] | length')
+  [[ "$deployed" == 1 ]] || die "expected exactly one deployed revision, found $deployed"
+  [[ "$(deployed_rollout "$ns" "$rel")" == 1 ]] || die "fix did not restore revision 1"
+  pass "fix recovered: exactly one deployed revision"
+
+  expect_helm_works "$ns" "$rel" 3
+  drop_namespace "$ns"
+}
+
+# ---------------------------------------------------------------- scenario 6
+
+# A LoadBalancer Service that never gets an address keeps helm --wait waiting on Helm 3.
+# Helm 4.3.0 does not wait for the address (the upgrade completes at once), so there is no
+# live helm to protect there.
+scenario_live_wait_loadbalancer() {
+  local ns=e2e-s6 rel=web
+  log "scenario 6: live helm --wait on a LoadBalancer Service without ingress"
+  if [[ $HELM_MAJOR != 3 ]]; then
+    info "skipped: Helm $HELM_MAJOR does not wait for a LoadBalancer ingress address"
+    return 0
+  fi
+  new_namespace "$ns"
+  "$HELM" install "$rel" "$CHART" -n "$ns" --wait --timeout 3m --set rollout=1 >/dev/null
+
+  start_bg "$HELM" upgrade "$rel" "$CHART" -n "$ns" --wait --timeout 10m --set rollout=2 --set loadBalancer=true
+  wait_status "$ns" "$rel" pending-upgrade 60
+  wait_for 60 "the Service to exist" kubectl -n "$ns" get "svc/$rel-lb"
+  kubectl -n "$ns" rollout status "deploy/$rel" --timeout=180s >/dev/null
+  sleep 3
+  kill -0 "$BG_PID" 2>/dev/null || die "scenario 6: helm exited; it should keep waiting for the load balancer"
+
+  scan_stuck "$ns"
+  [[ "$VERDICT" == possibly-running ]] || die "scenario 6: expected possibly-running while helm waits for the load balancer, got: $OUT"
+  grep -qF "Service/$rel-lb" <<<"$OUT" || die "scenario 6: the verdict must name the Service: $OUT"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --yes
+  expect_rc 3 "fix while helm waits for the load balancer"
+  [[ "$(latest_status "$ns" "$rel")" == pending-upgrade ]] || die "fix touched a release whose helm is alive"
+  pass "possibly-running and fix refuses while helm waits for the load balancer ingress"
+
+  kill_bg
+  drop_namespace "$ns"
+}
+
+# ---------------------------------------------------------------- scenario 7
+
+# A release record that does not decode must make scan fail, never report "nothing stuck".
+scenario_undecodable_record() {
+  local ns=e2e-s7
+  log "scenario 7: undecodable release record"
+  new_namespace "$ns"
+  kubectl -n "$ns" apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sh.helm.release.v1.broken.v1
+  labels: {owner: helm, name: broken, version: "1", status: pending-install}
+type: helm.sh/release.v1
+stringData:
+  release: "not-a-release"
+YAML
+  run "$UNSTICK" scan -n "$ns"
+  expect_rc 1 "scan with an undecodable record"
+  expect_out "$ns/broken" "scan with an undecodable record"
+  expect_out "cannot be decoded" "scan with an undecodable record"
+  if grep -qF "No release is stuck" <<<"$OUT"; then die "an incomplete scan claimed that nothing is stuck"; fi
+  pass "scan names the undecodable record, exits 1 and never claims nothing is stuck"
+  drop_namespace "$ns"
+}
+
+# ---------------------------------------------------------------- scenario 8
+
+# The plugin installs from a local checkout on this Helm generation and runs.
+scenario_plugin() {
+  log "scenario 8: helm plugin install from the local directory"
+  local data=$WORK/helm-data
+  mkdir -p "$data"
+  run env HELM_DATA_HOME="$data" HELM_UNSTICK_BINARY="$UNSTICK" "$HELM" plugin install "$ROOT"
+  expect_rc 0 "helm plugin install"
+  run env HELM_DATA_HOME="$data" "$HELM" unstick version
+  expect_rc 0 "helm unstick version"
+  run env HELM_DATA_HOME="$data" "$HELM" unstick scan -n default
+  expect_rc 0 "helm unstick scan"
+  expect_out "No release is stuck" "helm unstick scan"
+  pass "helm $HELM_MAJOR installs the plugin from the local directory and helm unstick scan runs"
+}
+
 # ---------------------------------------------------------------- run
 
-HELM_MAJOR=$("$HELM" version --short 2>&1 | sed -n 's/^v\([0-9]*\)\..*/\1/p' | head -n1)
-HELM_MAJOR=${HELM_MAJOR:-unknown}
+want() { [[ -z "${E2E_ONLY:-}" || " $E2E_ONLY " == *" $1 "* ]]; }
 
-scenario_interrupted_upgrade auto
-scenario_interrupted_upgrade mark-failed
-scenario_interrupted_upgrade direct
-scenario_live_upgrade
-scenario_interrupted_install mark-failed
-scenario_interrupted_install uninstall
-scenario_interrupted_rollback
+if want upgrade; then
+  scenario_interrupted_upgrade auto
+  scenario_interrupted_upgrade mark-failed
+  scenario_interrupted_upgrade direct
+fi
+if want live; then scenario_live_upgrade; fi
+if want install; then
+  scenario_interrupted_install mark-failed
+  scenario_interrupted_install uninstall
+fi
+if want rollback; then scenario_interrupted_rollback; fi
+if want live_wait; then scenario_live_wait_after_deadline; fi
+if want loadbalancer; then scenario_live_wait_loadbalancer; fi
+if want undecodable; then scenario_undecodable_record; fi
+if want plugin; then scenario_plugin; fi
 
 log "findings (paste into the README section on rollback behavior)"
 for f in ${FINDINGS[@]+"${FINDINGS[@]}"}; do printf '  - %s\n' "$f"; done

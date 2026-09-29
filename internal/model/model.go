@@ -11,6 +11,14 @@ import (
 // ErrNotFound is returned (wrapped) when a release does not exist.
 var ErrNotFound = errors.New("release not found")
 
+// ErrConflict is returned (wrapped) when a release record is no longer the one that was
+// inspected: someone wrote to it, so the caller's verdict is void.
+var ErrConflict = errors.New("release record changed since it was inspected")
+
+// ErrPending is returned (wrapped) when Helm refuses an operation because the release
+// already has a pending-* revision ("another operation is in progress").
+var ErrPending = errors.New("helm refused: the release has a pending revision")
+
 // Status is the Helm release status string (info.status, secret label "status").
 type Status string
 
@@ -45,6 +53,7 @@ type Revision struct {
 	Status      Status
 	Updated     time.Time // info.last_deployed: when the operation that wrote this revision started
 	ModifiedAt  time.Time // "modifiedAt" label of the storage record; zero when unknown
+	Version     string    // opaque version of the storage record (resourceVersion); guards writes
 	Chart       string    // name-version
 	Description string
 }
@@ -79,14 +88,33 @@ func (h History) Latest() (Revision, bool) {
 	return best, true
 }
 
+// Problem is a release that scan could not read completely, for example because one of its
+// storage records does not decode.
+type Problem struct {
+	Namespace string
+	Release   string
+	Err       string
+}
+
+// Listing is the result of looking for pending releases: the histories that were read and
+// the releases that could not be read. A listing with problems is incomplete.
+type Listing struct {
+	Histories []History
+	Problems  []Problem
+}
+
 // Stuck describes a release whose latest revision is pending-*.
 type Stuck struct {
 	Namespace string
 	Release   string
 	Pending   Revision  // the latest revision
 	Target    *Revision // newest deployed revision older than Pending; nil when there is none
-	Leftover  []Revision
-	Revisions []Revision // whole history, ascending
+	// Superseded is the newest superseded revision older than Pending, set only when Target
+	// is nil. Helm stores the old revision as superseded before it stores the new deployed
+	// one, so an interruption between the two writes leaves history with no deployed revision.
+	Superseded *Revision
+	Leftover   []Revision
+	Revisions  []Revision // whole history, ascending
 }
 
 // ActionOptions tune the Helm operations helm-unstick performs.
@@ -119,7 +147,27 @@ func Analyze(h History) *Stuck {
 		}
 	}
 	sort.Slice(s.Leftover, func(i, j int) bool { return s.Leftover[i].Number < s.Leftover[j].Number })
+	if s.Target == nil {
+		for i := len(revs) - 2; i >= 0; i-- {
+			if revs[i].Status == StatusSuperseded {
+				r := revs[i]
+				s.Superseded = &r
+				break
+			}
+		}
+	}
 	return s
+}
+
+// RollbackCandidate returns revision n if it may be rolled back to on request: it must be
+// older than the pending revision and must have been deployed at some point.
+func (s *Stuck) RollbackCandidate(n int) (Revision, bool) {
+	for _, r := range s.Revisions {
+		if r.Number == n && n < s.Pending.Number && (r.Status == StatusDeployed || r.Status == StatusSuperseded) {
+			return r, true
+		}
+	}
+	return Revision{}, false
 }
 
 // HasRollbackTarget reports whether "roll back to the last deployed revision" is a valid

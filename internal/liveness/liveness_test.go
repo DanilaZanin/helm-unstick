@@ -84,9 +84,24 @@ func TestDeploymentRollout(t *testing.T) {
 			json: `{"metadata":{"generation":4},"spec":{"replicas":0},"status":{"observedGeneration":4}}`,
 		},
 		{
-			name: "progress deadline exceeded is failed, not running",
+			// Helm 3 --wait keeps waiting after the progress deadline: it must still count.
+			name: "progress deadline exceeded does not end Helm's wait",
 			json: `{"metadata":{"generation":2},"spec":{"replicas":1},
 				"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1,"availableReplicas":0,
+				"conditions":[{"type":"Progressing","status":"False","reason":"ProgressDeadlineExceeded"}]}}`,
+			busy: true, why: "progress deadline exceeded",
+		},
+		{
+			name: "stale deadline condition does not hide a new generation",
+			json: `{"metadata":{"generation":3},"spec":{"replicas":1},
+				"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1,"availableReplicas":1,
+				"conditions":[{"type":"Progressing","status":"False","reason":"ProgressDeadlineExceeded"}]}}`,
+			busy: true, why: "has not observed the latest spec",
+		},
+		{
+			name: "complete rollout with a leftover deadline condition",
+			json: `{"metadata":{"generation":2},"spec":{"replicas":1},
+				"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1,"availableReplicas":1,
 				"conditions":[{"type":"Progressing","status":"False","reason":"ProgressDeadlineExceeded"}]}}`,
 		},
 		{
@@ -125,6 +140,18 @@ func TestStatefulSetRollout(t *testing.T) {
 		{"pods not ready", `{"metadata":{"generation":1},"spec":{"replicas":3},"status":{"observedGeneration":1,"updatedReplicas":3,"readyReplicas":2}}`, true},
 		{"pods not updated", `{"metadata":{"generation":2},"spec":{"replicas":3},"status":{"observedGeneration":2,"updatedReplicas":1,"readyReplicas":3}}`, true},
 		{"OnDelete strategy never rolls by itself", `{"metadata":{"generation":2},"spec":{"replicas":3,"updateStrategy":{"type":"OnDelete"}},"status":{"observedGeneration":1}}`, false},
+		{"finished partitioned rollout (replicas 3, partition 2, one pod updated)",
+			`{"metadata":{"generation":1},"spec":{"replicas":3,"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}},
+			"status":{"observedGeneration":1,"updatedReplicas":1,"readyReplicas":3,"currentRevision":"a","updateRevision":"b"}}`, false},
+		{"partitioned rollout still short of its updated pods",
+			`{"metadata":{"generation":1},"spec":{"replicas":3,"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}},
+			"status":{"observedGeneration":1,"updatedReplicas":0,"readyReplicas":3,"currentRevision":"a","updateRevision":"b"}}`, true},
+		{"unpartitioned rollout whose pods carry two revisions",
+			`{"metadata":{"generation":1},"spec":{"replicas":3},
+			"status":{"observedGeneration":1,"updatedReplicas":3,"readyReplicas":3,"currentRevision":"a","updateRevision":"b"}}`, true},
+		{"unpartitioned rollout on one revision",
+			`{"metadata":{"generation":1},"spec":{"replicas":3},
+			"status":{"observedGeneration":1,"updatedReplicas":3,"readyReplicas":3,"currentRevision":"a","updateRevision":"a"}}`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -279,5 +306,103 @@ func TestIntAtNumericTypes(t *testing.T) {
 	}
 	if _, ok := intAt(map[string]interface{}{"n": "3"}, "n"); ok {
 		t.Error("a string must not parse as a number")
+	}
+}
+
+func TestWorkloadSignalsAreBoundedByHelmTimeout(t *testing.T) {
+	sigs := Inspect(Ref{Kind: "Deployment", Name: "web"}, obj(t, `{"metadata":{"generation":2},"spec":{"replicas":1},"status":{"observedGeneration":1}}`), now, 0)
+	if len(sigs) != 1 || !sigs[0].Bounded {
+		t.Fatalf("a Helm-wait signal must be bounded by --helm-timeout: %+v", sigs)
+	}
+	recent := obj(t, `{"metadata":{"creationTimestamp":"`+now.Add(-time.Minute).Format(time.RFC3339)+`"}}`)
+	sigs = Inspect(Ref{Kind: "ConfigMap", Name: "cfg"}, recent, now, 10*time.Minute)
+	if len(sigs) != 1 || sigs[0].Bounded {
+		t.Fatalf("a recent change is real activity and must not expire with the Helm timeout: %+v", sigs)
+	}
+}
+
+func TestPodReadiness(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		busy bool
+	}{
+		{"running but not ready", `{"status":{"phase":"Running","conditions":[{"type":"Ready","status":"False"}]}}`, true},
+		{"pending", `{"status":{"phase":"Pending"}}`, true},
+		{"ready", `{"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sigs := Inspect(Ref{Kind: "Pod", Name: "p"}, obj(t, tt.json), now, 0)
+			if got := hasKind(sigs, verdict.SignalNotReady); got != tt.busy {
+				t.Errorf("not-ready signal = %v, want %v (%v)", got, tt.busy, sigs)
+			}
+		})
+	}
+}
+
+func TestPersistentVolumeClaim(t *testing.T) {
+	if sigs := Inspect(Ref{Kind: "PersistentVolumeClaim", Name: "data"}, obj(t, `{"status":{"phase":"Pending"}}`), now, 0); !hasKind(sigs, verdict.SignalNotReady) {
+		t.Errorf("a Pending claim is something Helm --wait waits for: %v", sigs)
+	}
+	if sigs := Inspect(Ref{Kind: "PersistentVolumeClaim", Name: "data"}, obj(t, `{"status":{"phase":"Bound"}}`), now, 0); len(sigs) != 0 {
+		t.Errorf("a Bound claim is ready: %v", sigs)
+	}
+}
+
+func TestService(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		busy bool
+	}{
+		{"load balancer without ingress", `{"spec":{"type":"LoadBalancer","clusterIP":"10.0.0.1"},"status":{"loadBalancer":{}}}`, true},
+		{"load balancer with ingress", `{"spec":{"type":"LoadBalancer","clusterIP":"10.0.0.1"},"status":{"loadBalancer":{"ingress":[{"ip":"1.2.3.4"}]}}}`, false},
+		{"load balancer with external IPs", `{"spec":{"type":"LoadBalancer","clusterIP":"10.0.0.1","externalIPs":["1.2.3.4"]},"status":{"loadBalancer":{}}}`, false},
+		{"cluster IP not allocated", `{"spec":{"type":"ClusterIP"}}`, true},
+		{"cluster IP", `{"spec":{"type":"ClusterIP","clusterIP":"10.0.0.1"}}`, false},
+		{"headless", `{"spec":{"type":"ClusterIP","clusterIP":"None"}}`, false},
+		{"external name", `{"spec":{"type":"ExternalName"}}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sigs := Inspect(Ref{Kind: "Service", Name: "lb"}, obj(t, tt.json), now, 0)
+			if got := hasKind(sigs, verdict.SignalNotReady); got != tt.busy {
+				t.Errorf("not-ready signal = %v, want %v (%v)", got, tt.busy, sigs)
+			}
+		})
+	}
+}
+
+func TestReplicaSetAndCRD(t *testing.T) {
+	if sigs := Inspect(Ref{Kind: "ReplicaSet", Name: "rs"}, obj(t, `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"readyReplicas":1}}`), now, 0); !hasKind(sigs, verdict.SignalNotReady) {
+		t.Errorf("ReplicaSet with 1 of 2 replicas ready: %v", sigs)
+	}
+	if sigs := Inspect(Ref{Kind: "ReplicaSet", Name: "rs"}, obj(t, `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"readyReplicas":2}}`), now, 0); len(sigs) != 0 {
+		t.Errorf("ready ReplicaSet: %v", sigs)
+	}
+	crd := Ref{APIVersion: "apiextensions.k8s.io/v1", Kind: "CustomResourceDefinition", Name: "foos.example.com"}
+	if sigs := Inspect(crd, obj(t, `{"status":{"conditions":[{"type":"Established","status":"False"}]}}`), now, 0); !hasKind(sigs, verdict.SignalNotReady) {
+		t.Errorf("a CRD that is not Established: %v", sigs)
+	}
+	if sigs := Inspect(crd, obj(t, `{"status":{"conditions":[{"type":"Established","status":"True"}]}}`), now, 0); len(sigs) != 0 {
+		t.Errorf("an Established CRD: %v", sigs)
+	}
+}
+
+func TestCustomResourceConditions(t *testing.T) {
+	cr := Ref{APIVersion: "cert-manager.io/v1", Kind: "Certificate", Name: "tls"}
+	if sigs := Inspect(cr, obj(t, `{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`), now, 0); !hasKind(sigs, verdict.SignalNotReady) {
+		t.Errorf("a custom resource reporting Ready=False: %v", sigs)
+	}
+	if sigs := Inspect(cr, obj(t, `{"status":{"conditions":[{"type":"Reconciling","status":"True"}]}}`), now, 0); !hasKind(sigs, verdict.SignalNotReady) {
+		t.Errorf("a custom resource that is Reconciling: %v", sigs)
+	}
+	if sigs := Inspect(cr, obj(t, `{"status":{"conditions":[{"type":"Ready","status":"True"}]}}`), now, 0); len(sigs) != 0 {
+		t.Errorf("a ready custom resource: %v", sigs)
+	}
+	cm := Ref{APIVersion: "v1", Kind: "ConfigMap", Name: "cfg"}
+	if sigs := Inspect(cm, obj(t, `{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`), now, 0); len(sigs) != 0 {
+		t.Errorf("built-in kinds without readiness rules are never waited on: %v", sigs)
 	}
 }

@@ -18,7 +18,7 @@ import (
 
 var (
 	t0      = time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
-	errBusy = errors.New("another operation (install/upgrade/rollback) is in progress")
+	errBusy = fmt.Errorf("%w: another operation (install/upgrade/rollback) is in progress", model.ErrPending)
 )
 
 type key struct{ ns, name string }
@@ -34,6 +34,15 @@ type fakeBackend struct {
 	leavePending  bool // a successful Rollback leaves the old pending revision pending
 	failRollback  bool // Rollback always fails
 	calls         []string
+
+	evidenceSeq      []verdict.Evidence // one entry per Inspect call, then evidence again
+	inspects         int
+	problems         []model.Problem
+	rollbackErr      error       // returned by a failing Rollback instead of errBusy
+	failAfterCreate  bool        // Rollback writes revision N+1 as failed and errors, like a helm --wait timeout
+	beforeMarkFailed func()      // runs at the start of MarkFailed, to change the release underneath
+	afterRollback    func(n int) // runs after a successful Rollback created revision n
+	onInspect        func(call int)
 }
 
 func newFake(revs ...model.Revision) *fakeBackend {
@@ -54,8 +63,8 @@ func (f *fakeBackend) history(ns, name string) (model.History, bool) {
 	return model.History{Namespace: ns, Release: name, Revisions: append([]model.Revision(nil), revs...)}, true
 }
 
-func (f *fakeBackend) ListPending(_ context.Context, ns string) ([]model.History, error) {
-	var out []model.History
+func (f *fakeBackend) ListPending(_ context.Context, ns string) (model.Listing, error) {
+	out := model.Listing{Problems: f.problems}
 	for k := range f.releases {
 		if ns != "" && k.ns != ns {
 			continue
@@ -63,12 +72,12 @@ func (f *fakeBackend) ListPending(_ context.Context, ns string) ([]model.History
 		h, _ := f.history(k.ns, k.name)
 		for _, r := range h.Revisions {
 			if r.Status.IsPending() {
-				out = append(out, h)
+				out.Histories = append(out.Histories, h)
 				break
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Release < out[j].Release })
+	sort.Slice(out.Histories, func(i, j int) bool { return out.Histories[i].Release < out.Histories[j].Release })
 	return out, nil
 }
 
@@ -81,6 +90,13 @@ func (f *fakeBackend) History(_ context.Context, ns, name string) (model.History
 }
 
 func (f *fakeBackend) Inspect(_ context.Context, _ *model.Stuck, _ time.Time, _ time.Duration) (verdict.Evidence, error) {
+	f.inspects++
+	if f.onInspect != nil {
+		f.onInspect(f.inspects)
+	}
+	if f.inspects <= len(f.evidenceSeq) {
+		return f.evidenceSeq[f.inspects-1], f.inspectErr
+	}
 	return f.evidence, f.inspectErr
 }
 
@@ -95,25 +111,45 @@ func (f *fakeBackend) latest(ns, name string) *model.Revision {
 	return &revs[best]
 }
 
-func (f *fakeBackend) Rollback(_ context.Context, ns, name string, revision int, _ model.ActionOptions) error {
+func (f *fakeBackend) Rollback(_ context.Context, ns, name string, revision int, _ model.ActionOptions) (int, error) {
 	f.calls = append(f.calls, fmt.Sprintf("rollback %d", revision))
 	last := f.latest(ns, name)
 	if f.failRollback || (f.refusePending && last.Status.IsPending()) {
-		return errBusy
+		if f.rollbackErr != nil {
+			return 0, f.rollbackErr
+		}
+		return 0, errBusy
 	}
 	if !f.leavePending && last.Status.IsPending() {
 		last.Status = model.StatusSuperseded
 	}
 	k := key{ns, name}
-	f.releases[k] = append(f.releases[k], model.Revision{Number: last.Number + 1, Status: model.StatusDeployed, Updated: t0, Chart: "web-1.0.0"})
-	return nil
+	created := last.Number + 1
+	status := model.StatusDeployed
+	if f.failAfterCreate {
+		status = model.StatusFailed
+	}
+	f.releases[k] = append(f.releases[k], model.Revision{Number: created, Status: status, Updated: t0, Chart: "web-1.0.0"})
+	if f.failAfterCreate {
+		return created, errors.New("timed out waiting for the condition")
+	}
+	if f.afterRollback != nil {
+		f.afterRollback(created)
+	}
+	return created, nil
 }
 
-func (f *fakeBackend) MarkFailed(_ context.Context, ns, name string, revision int, _ string) error {
-	f.calls = append(f.calls, fmt.Sprintf("mark-failed %d", revision))
+func (f *fakeBackend) MarkFailed(_ context.Context, ns, name string, from model.Revision, _ string) error {
+	f.calls = append(f.calls, fmt.Sprintf("mark-failed %d", from.Number))
+	if f.beforeMarkFailed != nil {
+		f.beforeMarkFailed()
+	}
 	revs := f.releases[key{ns, name}]
 	for i := range revs {
-		if revs[i].Number == revision {
+		if revs[i].Number == from.Number {
+			if revs[i].Status != from.Status || revs[i].Version != from.Version {
+				return fmt.Errorf("revision %d is %s now: %w", from.Number, revs[i].Status, model.ErrConflict)
+			}
 			revs[i].Status = model.StatusFailed
 			return nil
 		}
@@ -385,11 +421,11 @@ func TestFixAutoDoesNotRetryWhenStateChanged(t *testing.T) {
 // changingBackend appends a new revision as a side effect of the first failed rollback.
 type changingBackend struct{ *fakeBackend }
 
-func (c *changingBackend) Rollback(ctx context.Context, ns, name string, revision int, o model.ActionOptions) error {
-	err := c.fakeBackend.Rollback(ctx, ns, name, revision, o)
+func (c *changingBackend) Rollback(ctx context.Context, ns, name string, revision int, o model.ActionOptions) (int, error) {
+	n, err := c.fakeBackend.Rollback(ctx, ns, name, revision, o)
 	k := key{ns, name}
 	c.releases[k] = append(c.releases[k], model.Revision{Number: 4, Status: model.StatusPendingUpgrade, Updated: t0})
-	return err
+	return n, err
 }
 
 func TestFixTidiesRevisionsLeftPending(t *testing.T) {
@@ -681,5 +717,203 @@ func TestShellQuote(t *testing.T) {
 		if got := shellQuote(in); got != want {
 			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ---- review fixes
+
+var waiting = verdict.Signal{Kind: verdict.SignalNotReady, Object: "Service/lb", Detail: "helm --wait may still be waiting: load balancer has no ingress address yet", Bounded: true}
+
+func TestHelmTimeoutDecidesWhenAWaitingReleaseIsStale(t *testing.T) {
+	// record age 7m, --older-than 0s: only Helm's own timeout can still protect the release
+	f := newFake(rev(1, model.StatusDeployed, 48*time.Hour), rev(2, model.StatusPendingUpgrade, 7*time.Minute))
+	f.evidence = verdict.Evidence{Signals: []verdict.Signal{waiting}}
+
+	code, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s", "--helm-timeout", "30m")
+	if code != ExitRefused || !strings.Contains(out, "Service/lb") {
+		t.Fatalf("a helm with --timeout 30m may still be waiting: exit = %d\n%s", code, out)
+	}
+	assertCalls(t, f)
+
+	code, out, _ = run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s")
+	if code != ExitOK {
+		t.Fatalf("with the default 5m timeout plus grace the record is past helm's wait: exit = %d\n%s", code, out)
+	}
+	assertCalls(t, f, "rollback 1")
+}
+
+func TestFixReinspectsAfterConfirmation(t *testing.T) {
+	for name, args := range map[string][]string{
+		"confirmed": {"fix", "web", "-n", "prod"},
+		"--yes":     {"fix", "web", "-n", "prod", "--yes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := stuckUpgrade()
+			// the first look is quiet, the second one finds a load balancer helm is waiting on
+			f.evidenceSeq = []verdict.Evidence{{}, {Signals: []verdict.Signal{{Kind: verdict.SignalRollout, Object: "Deployment/web", Detail: "rollout in progress: 0 of 1 replicas updated"}}}}
+			code, out, _ := run(t, f, "y\n", true, args...)
+			if code != ExitRefused || !strings.Contains(out, "changed") {
+				t.Fatalf("exit = %d, want %d\n%s", code, ExitRefused, out)
+			}
+			assertCalls(t, f)
+		})
+	}
+}
+
+func TestMarkFailedNeverOverwritesARecordThatMoved(t *testing.T) {
+	f := newFake(rev(1, model.StatusPendingInstall, 3*time.Hour))
+	// the live helm finishes between the check and the write
+	f.beforeMarkFailed = func() { f.releases[key{"prod", "web"}][0].Status = model.StatusDeployed }
+	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--first-install=mark-failed")
+	if code != ExitError || !strings.Contains(errOut, "changed") {
+		t.Errorf("exit = %d, stderr = %q", code, errOut)
+	}
+	if statusOf(f, 1) != model.StatusDeployed {
+		t.Errorf("a finished deploy was overwritten with %s", statusOf(f, 1))
+	}
+}
+
+func TestAutoStrategyFallsBackOnlyOnThePendingRefusal(t *testing.T) {
+	for name, err := range map[string]error{
+		"rbac":       errors.New(`secrets is forbidden: User "ci" cannot create resource "secrets"`),
+		"transport":  errors.New("dial tcp 10.0.0.1:443: i/o timeout"),
+		"validation": errors.New("release has no revision 9"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := stuckUpgrade()
+			f.failRollback, f.rollbackErr = true, err
+			code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+			if code != ExitError || !strings.Contains(errOut, err.Error()) {
+				t.Errorf("exit = %d, stderr = %q", code, errOut)
+			}
+			assertCalls(t, f, "rollback 2")
+		})
+	}
+}
+
+func TestFixReportsTheRevisionItCreated(t *testing.T) {
+	f := stuckUpgrade()
+	// another deploy lands right after our rollback: the head is no longer our revision
+	f.afterRollback = func(n int) {
+		k := key{"prod", "web"}
+		f.releases[k] = append(f.releases[k], model.Revision{Number: n + 1, Status: model.StatusDeployed, Updated: t0})
+	}
+	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitError || !strings.Contains(errOut, "concurrent") || !strings.Contains(errOut, "latest revision is 5") {
+		t.Errorf("exit = %d, stderr = %q\n%s", code, errOut, out)
+	}
+	if strings.Contains(out, "Done.") {
+		t.Errorf("must not claim success:\n%s", out)
+	}
+}
+
+func TestFailedRollbackIsNotBlamedOnAConcurrentChange(t *testing.T) {
+	f := stuckUpgrade()
+	f.failAfterCreate = true // helm wrote revision 4 as failed because --wait timed out
+	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--wait")
+	if code != ExitError {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(errOut, "changed meanwhile") {
+		t.Errorf("our own failed rollback is not a concurrent change: %q", errOut)
+	}
+	if !strings.Contains(errOut, "revision 4") || !strings.Contains(errOut, "timed out") {
+		t.Errorf("the error must name the revision the rollback wrote and the cause: %q", errOut)
+	}
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "mark-failed") {
+			t.Errorf("no retry after the rollback already wrote a revision: %v", f.calls)
+		}
+	}
+}
+
+func TestFixStopsBeforeWritingWhenInterrupted(t *testing.T) {
+	f := stuckUpgrade()
+	ctx, cancel := context.WithCancel(context.Background())
+	f.onInspect = func(call int) {
+		if call == 2 { // Ctrl-C arrives while the recheck runs
+			cancel()
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	env := Env{Stdin: strings.NewReader(""), Stdout: &stdout, Stderr: &stderr, Now: func() time.Time { return t0 }, Tool: "helm-unstick"}
+	code := Run(ctx, []string{"fix", "web", "-n", "prod", "--yes"}, env, func(Global) (Backend, error) { return f, nil })
+	if code != ExitError || !strings.Contains(stderr.String(), "interrupted") {
+		t.Errorf("exit = %d, stderr = %q", code, stderr.String())
+	}
+	assertCalls(t, f)
+}
+
+func TestScanReportsReleasesItCouldNotRead(t *testing.T) {
+	f := stuckUpgrade()
+	f.problems = []model.Problem{{Namespace: "prod", Release: "broken", Err: "record sh.helm.release.v1.broken.v3 could not be decoded"}}
+	code, out, errOut := run(t, f, "", false, "scan", "-n", "prod")
+	if code != ExitError {
+		t.Errorf("exit = %d, an incomplete scan must not succeed", code)
+	}
+	if !strings.Contains(errOut, "prod/broken") || !strings.Contains(errOut, "could not be decoded") {
+		t.Errorf("stderr must name the release and the error: %q", errOut)
+	}
+	if !strings.Contains(out, "pending-upgrade") {
+		t.Errorf("the releases that could be read are still listed:\n%s", out)
+	}
+
+	clean := newFake(rev(1, model.StatusDeployed, time.Hour))
+	clean.problems = f.problems
+	code, out, errOut = run(t, clean, "", false, "scan", "-n", "prod")
+	if code != ExitError || strings.Contains(out, "No release is stuck") {
+		t.Errorf("an incomplete scan must never say nothing is stuck: exit = %d\n%s", code, out)
+	}
+	if !strings.Contains(errOut, "incomplete") {
+		t.Errorf("stderr = %q", errOut)
+	}
+	code, out, _ = run(t, clean, "", false, "scan", "-n", "prod", "-o", "json")
+	if code != ExitError || strings.TrimSpace(out) != "[]" {
+		t.Errorf("json: exit = %d, out = %q", code, out)
+	}
+}
+
+func TestFixToRevisionRollsBackToASupersededRevision(t *testing.T) {
+	hist := func() *fakeBackend {
+		return newFake(rev(1, model.StatusSuperseded, 72*time.Hour), rev(2, model.StatusSuperseded, 48*time.Hour), rev(3, model.StatusPendingUpgrade, 2*time.Hour))
+	}
+	f := hist()
+	code, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitStuck || !strings.Contains(out, "--to-revision 2") {
+		t.Errorf("without --to-revision the plan is printed and nothing changes: exit = %d\n%s", code, out)
+	}
+	assertCalls(t, f)
+
+	f = hist()
+	code, out, _ = run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--to-revision", "2")
+	if code != ExitOK {
+		t.Fatalf("exit = %d\n%s", code, out)
+	}
+	assertCalls(t, f, "rollback 2")
+
+	for _, bad := range []string{"3", "9", "0", "-1"} {
+		f = hist()
+		if code, _, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--to-revision", bad); code != ExitError {
+			t.Errorf("--to-revision %s: exit = %d", bad, code)
+		}
+		assertCalls(t, f)
+	}
+}
+
+func TestManualCommandsCarryTheClusterSelection(t *testing.T) {
+	_, out, _ := run(t, stuckUpgrade(), "", false, "explain", "web", "-n", "prod",
+		"--kube-context", "staging", "--kubeconfig", "/tmp/kc", "--driver", "configmap")
+	want := "HELM_DRIVER=configmap helm rollback web 2 -n prod --kube-context staging --kubeconfig /tmp/kc"
+	if !strings.Contains(out, want) {
+		t.Errorf("explain would print a command for another cluster:\n%s\nwant %q", out, want)
+	}
+}
+
+func TestOverwrittenRefusalAdvice(t *testing.T) {
+	f := stuckUpgrade()
+	f.evidence = verdict.Evidence{Signals: []verdict.Signal{waiting}}
+	_, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s", "--helm-timeout", "1h")
+	if strings.Contains(out, "raise --older-than") {
+		t.Errorf("wrong advice in the refusal:\n%s", out)
 	}
 }

@@ -1,0 +1,12 @@
+{{- if .Values.loadBalancer }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: 80
+{{- end }}

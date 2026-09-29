@@ -8,11 +8,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/release"
+	"helm.sh/helm/v3/pkg/storage"
 	"helm.sh/helm/v3/pkg/storage/driver"
 
 	"github.com/DanilaZanin/helm-unstick/internal/model"
@@ -46,78 +49,90 @@ func (c *Client) config(namespace string) (*action.Configuration, error) {
 
 type releaseKey struct{ namespace, name string }
 
-// ListPending returns the full history of every release that has a pending-* revision.
-func (c *Client) ListPending(ctx context.Context, namespace string) ([]model.History, error) {
-	cfg, err := c.config(namespace)
-	if err != nil {
-		return nil, err
+// checkDriver rejects storage that has no Kubernetes records to read and guard.
+func (c *Client) checkDriver() error {
+	switch c.driver {
+	case "", "secret", "secrets", "configmap", "configmaps":
+		return nil
 	}
-	seen := map[releaseKey]bool{}
-	for _, status := range model.PendingStatuses {
-		rels, err := cfg.Releases.Driver.Query(map[string]string{"owner": "helm", "status": string(status)})
-		if err != nil {
-			if errors.Is(err, driver.ErrReleaseNotFound) {
-				continue
-			}
-			return nil, fmt.Errorf("querying releases with status %s: %w", status, err)
-		}
-		for _, rel := range rels {
-			ns := rel.Namespace
-			if ns == "" {
-				ns = namespace
-			}
-			seen[releaseKey{ns, rel.Name}] = true
-		}
-	}
-	keys := make([]releaseKey, 0, len(seen))
-	for k := range seen {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].namespace != keys[j].namespace {
-			return keys[i].namespace < keys[j].namespace
-		}
-		return keys[i].name < keys[j].name
-	})
-	histories := make([]model.History, 0, len(keys))
-	for _, k := range keys {
-		h, err := c.History(ctx, k.namespace, k.name)
-		if err != nil {
-			if errors.Is(err, model.ErrNotFound) {
-				continue // deleted between the query and the read
-			}
-			return nil, err
-		}
-		histories = append(histories, h)
-	}
-	return histories, nil
+	return fmt.Errorf("unsupported storage driver %q: only secret and configmap can be inspected safely", c.driver)
 }
 
-// History returns every stored revision of one release.
+// ListPending returns the full history of every release that has a pending-* revision.
+// A release whose records cannot be read becomes a Problem instead of disappearing.
+func (c *Client) ListPending(ctx context.Context, namespace string) (model.Listing, error) {
+	var out model.Listing
+	if err := c.checkDriver(); err != nil {
+		return out, err
+	}
+	kube, err := c.access()
+	if err != nil {
+		return out, err
+	}
+	keys, err := pendingReleases(ctx, kube.kc, c.driver, namespace)
+	if err != nil {
+		return out, fmt.Errorf("listing release records: %w", err)
+	}
+	for _, k := range keys {
+		h, err := c.History(ctx, k.namespace, k.name)
+		switch {
+		case err == nil:
+			out.Histories = append(out.Histories, h)
+		case errors.Is(err, model.ErrNotFound):
+			// deleted between the listing and the read
+		default:
+			out.Problems = append(out.Problems, model.Problem{Namespace: k.namespace, Release: k.name, Err: err.Error()})
+		}
+	}
+	return out, nil
+}
+
+// History returns every stored revision of one release. Records the SDK cannot decode make
+// it fail: a history with a hidden revision is not something to act on.
 func (c *Client) History(ctx context.Context, namespace, name string) (model.History, error) {
+	if err := ctx.Err(); err != nil {
+		return model.History{}, err
+	}
+	if err := c.checkDriver(); err != nil {
+		return model.History{}, err
+	}
+	kube, err := c.access()
+	if err != nil {
+		return model.History{}, err
+	}
+	recs, err := listRecords(ctx, kube.kc, c.driver, namespace, "owner=helm,name="+name)
+	if err != nil {
+		return model.History{}, fmt.Errorf("listing the storage records of %q: %w", name, err)
+	}
+	if len(recs) == 0 {
+		return model.History{}, fmt.Errorf("release %q not found in namespace %q: %w", name, namespace, model.ErrNotFound)
+	}
 	cfg, err := c.config(namespace)
 	if err != nil {
 		return model.History{}, err
 	}
 	rels, err := cfg.Releases.History(name)
-	if err != nil {
-		if errors.Is(err, driver.ErrReleaseNotFound) {
-			return model.History{}, fmt.Errorf("release %q not found in namespace %q: %w", name, namespace, model.ErrNotFound)
-		}
+	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return model.History{}, fmt.Errorf("reading history of %q: %w", name, err)
 	}
+	byNumber := map[int]record{}
+	for _, r := range recs {
+		if n, ok := r.revision(); ok {
+			byNumber[n] = r
+		}
+	}
+	decoded := map[int]bool{}
 	h := model.History{Namespace: namespace, Release: name}
 	for _, rel := range rels {
-		h.Revisions = append(h.Revisions, toRevision(rel))
-	}
-	// The storage record carries a write time of its own; it is only needed for the latest
-	// revision, and only ever makes the release look more recently active.
-	if latest, ok := h.Latest(); ok && latest.Status.IsPending() {
-		for i := range h.Revisions {
-			if h.Revisions[i].Number == latest.Number {
-				h.Revisions[i].ModifiedAt = c.recordWriteTime(ctx, namespace, name, latest.Number)
-			}
+		decoded[rel.Version] = true
+		rev := toRevision(rel)
+		if rec, ok := byNumber[rel.Version]; ok {
+			rev.ModifiedAt, rev.Version = rec.Written, rec.Version
 		}
+		h.Revisions = append(h.Revisions, rev)
+	}
+	if err := checkDecoded(recs, decoded); err != nil {
+		return model.History{}, fmt.Errorf("release %q: %w", name, err)
 	}
 	return h, nil
 }
@@ -135,39 +150,93 @@ func toRevision(rel *release.Release) model.Revision {
 	return r
 }
 
-// Rollback rolls the release back to a revision with the SDK.
-func (c *Client) Rollback(_ context.Context, namespace, name string, revision int, opts model.ActionOptions) error {
+// recorder remembers which revisions a Helm action stored, so the caller learns the number of
+// the revision its own rollback created instead of guessing from the latest one.
+type recorder struct {
+	driver.Driver
+	mu      sync.Mutex
+	created []int
+}
+
+func (r *recorder) Create(key string, rls *release.Release) error {
+	err := r.Driver.Create(key, rls)
+	if err == nil {
+		r.mu.Lock()
+		r.created = append(r.created, rls.Version)
+		r.mu.Unlock()
+	}
+	return err
+}
+
+func (r *recorder) last() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.created) == 0 {
+		return 0
+	}
+	return r.created[len(r.created)-1]
+}
+
+// runCtx runs a Helm SDK call, which takes no context, and gives up waiting for it when ctx
+// ends. The call may still finish in the background until the process exits, which is why
+// the error says so.
+func runCtx(ctx context.Context, what string, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%s: interrupted while Helm was working; it may have partly completed, check helm history: %w", what, ctx.Err())
+	}
+}
+
+// Rollback rolls the release back to a revision with the SDK and returns the revision it created.
+func (c *Client) Rollback(ctx context.Context, namespace, name string, revision int, opts model.ActionOptions) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	cfg, err := c.config(namespace)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	rec := &recorder{Driver: cfg.Releases.Driver}
+	cfg.Releases = storage.Init(rec)
 	rb := action.NewRollback(cfg)
 	rb.Version = revision
 	rb.Wait = opts.Wait
 	rb.Timeout = opts.Timeout
-	return rb.Run(name)
+	err = runCtx(ctx, "rollback", func() error { return rb.Run(name) })
+	if err != nil {
+		// Helm's refusal text is not an exported error value.
+		if msg := err.Error(); strings.Contains(msg, "another operation") && strings.Contains(msg, "in progress") {
+			err = fmt.Errorf("%w: %s", model.ErrPending, msg)
+		}
+	}
+	return rec.last(), err
 }
 
-// MarkFailed sets one revision to failed and rewrites its storage record.
-func (c *Client) MarkFailed(_ context.Context, namespace, name string, revision int, reason string) error {
-	cfg, err := c.config(namespace)
+// MarkFailed sets one pending revision to failed, conditional on its storage record being
+// exactly the one that was inspected.
+func (c *Client) MarkFailed(ctx context.Context, namespace, name string, from model.Revision, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.checkDriver(); err != nil {
+		return err
+	}
+	kube, err := c.access()
 	if err != nil {
 		return err
 	}
-	rel, err := cfg.Releases.Get(name, revision)
-	if err != nil {
-		return fmt.Errorf("loading revision %d of %q: %w", revision, name, err)
-	}
-	if rel.Info == nil {
-		rel.Info = &release.Info{}
-	}
-	rel.Info.Status = release.StatusFailed
-	rel.Info.Description = reason
-	return cfg.Releases.Update(rel)
+	return markRecordFailed(ctx, kube.kc, c.driver, namespace, name, from, reason, time.Now())
 }
 
 // Uninstall removes the release together with its history.
-func (c *Client) Uninstall(_ context.Context, namespace, name string, opts model.ActionOptions) error {
+func (c *Client) Uninstall(ctx context.Context, namespace, name string, opts model.ActionOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cfg, err := c.config(namespace)
 	if err != nil {
 		return err
@@ -175,6 +244,5 @@ func (c *Client) Uninstall(_ context.Context, namespace, name string, opts model
 	un := action.NewUninstall(cfg)
 	un.Wait = opts.Wait
 	un.Timeout = opts.Timeout
-	_, err = un.Run(name)
-	return err
+	return runCtx(ctx, "uninstall", func() error { _, err := un.Run(name); return err })
 }

@@ -44,7 +44,7 @@ func dedupe(refs []liveness.Ref) []liveness.Ref {
 }
 
 // parseManifest extracts kind, name and namespace from every document of a YAML stream.
-// Documents without a fixed name (generateName) cannot be looked up and are skipped.
+// A document with generateName instead of name becomes a Ref with GenerateName set.
 func parseManifest(manifest, defaultNamespace string, hook bool) ([]liveness.Ref, error) {
 	dec := yaml.NewYAMLOrJSONDecoder(strings.NewReader(manifest), 4096)
 	var refs []liveness.Ref
@@ -76,12 +76,16 @@ func appendRefs(refs []liveness.Ref, doc map[string]interface{}, defaultNamespac
 	kind, _ := doc["kind"].(string)
 	metadata, _ := doc["metadata"].(map[string]interface{})
 	name, _ := metadata["name"].(string)
+	generateName, _ := metadata["generateName"].(string)
 	namespace, _ := metadata["namespace"].(string)
-	if apiVersion == "" || kind == "" || name == "" {
+	if apiVersion == "" || kind == "" || (name == "" && generateName == "") {
 		return refs
 	}
 	if namespace == "" {
 		namespace = defaultNamespace
 	}
-	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, Hook: hook})
+	if name != "" {
+		generateName = ""
+	}
+	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, GenerateName: generateName, Hook: hook})
 }

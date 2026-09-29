@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/DanilaZanin/helm-unstick/internal/model"
+	"github.com/DanilaZanin/helm-unstick/internal/plan"
 	"github.com/DanilaZanin/helm-unstick/internal/verdict"
 )
 
@@ -30,6 +31,8 @@ const (
 const (
 	DefaultOlderThan = 10 * time.Minute
 	DefaultTimeout   = 5 * time.Minute
+	// DefaultHelmTimeout is Helm's own default for --timeout.
+	DefaultHelmTimeout = 5 * time.Minute
 )
 
 // Global is the cluster selection shared by every command.
@@ -45,17 +48,21 @@ type Backend interface {
 	// Namespace is the namespace used when the user gave none.
 	Namespace() string
 	// ListPending returns the full history of every release that has a pending-* revision.
-	// An empty namespace means all namespaces.
-	ListPending(ctx context.Context, namespace string) ([]model.History, error)
+	// An empty namespace means all namespaces. Releases whose records cannot be read are
+	// listed as problems, never dropped silently.
+	ListPending(ctx context.Context, namespace string) (model.Listing, error)
 	// History returns the full history of one release; a missing release wraps model.ErrNotFound.
 	History(ctx context.Context, namespace, release string) (model.History, error)
 	// Inspect looks at the live objects of the pending revision and reports signs of activity.
 	// Checks that cannot be completed go into Evidence.Errors rather than the returned error.
 	Inspect(ctx context.Context, s *model.Stuck, now time.Time, window time.Duration) (verdict.Evidence, error)
-	// Rollback rolls the release back to revision through the Helm SDK.
-	Rollback(ctx context.Context, namespace, release string, revision int, opts model.ActionOptions) error
-	// MarkFailed sets the status of one revision to failed.
-	MarkFailed(ctx context.Context, namespace, release string, revision int, reason string) error
+	// Rollback rolls the release back to revision through the Helm SDK and returns the number
+	// of the revision it created (0 when it created none), also when it fails afterwards.
+	// A refusal because the release has a pending revision wraps model.ErrPending.
+	Rollback(ctx context.Context, namespace, release string, revision int, opts model.ActionOptions) (int, error)
+	// MarkFailed sets one revision to failed, but only if its storage record is still the one
+	// in from (same status and Version). Otherwise it writes nothing and wraps model.ErrConflict.
+	MarkFailed(ctx context.Context, namespace, release string, from model.Revision, reason string) error
 	// Uninstall removes the release and, unless kept, its history.
 	Uninstall(ctx context.Context, namespace, release string, opts model.ActionOptions) error
 }
@@ -116,10 +123,10 @@ func usage(tool string) string {
 	return fmt.Sprintf(`%[1]s finds Helm releases stuck in a pending-* state and recovers them safely.
 
 Usage:
-  %[1]s scan    [-n NAMESPACE | -A] [--older-than 10m] [-o table|json]
-  %[1]s explain RELEASE [-n NAMESPACE] [--older-than 10m]
-  %[1]s fix     RELEASE [-n NAMESPACE] [--dry-run] [--yes] [--older-than 10m]
-                [--force-unknown] [--first-install uninstall|mark-failed]
+  %[1]s scan    [-n NAMESPACE | -A] [--older-than 10m] [--helm-timeout 5m] [-o table|json]
+  %[1]s explain RELEASE [-n NAMESPACE] [--older-than 10m] [--helm-timeout 5m]
+  %[1]s fix     RELEASE [-n NAMESPACE] [--dry-run] [--yes] [--older-than 10m] [--helm-timeout 5m]
+                [--force-unknown] [--first-install uninstall|mark-failed] [--to-revision N]
                 [--strategy auto|direct|mark-failed] [--wait] [--timeout 5m]
   %[1]s version
 
@@ -131,9 +138,13 @@ Common flags:
 
 Exit codes:
   0  ok, or nothing is stuck
-  1  error
+  1  error, or a scan that could not read every release
   2  scan found stuck releases, or fix left one stuck for you to decide
   3  fix refused: the operation may still be running, or liveness could not be verified
+
+--helm-timeout: set it to the --timeout your deploys pass to helm (default 5m, Helm's own
+default). A live helm --wait may still be waiting on a not-ready Pod, volume, load balancer
+or rollout until the record is older than that timeout plus a minute.
 
 fix acts only on releases with verdict "stale". Run "%[1]s explain RELEASE" to see why.
 `, tool)
@@ -156,6 +167,29 @@ func (c *commonFlags) validate() error {
 		return nil
 	}
 	return fmt.Errorf("unsupported --driver %q: use secret or configmap", c.Driver)
+}
+
+// thresholds are the two time limits that turn evidence into a verdict.
+type thresholds struct{ olderThan, helmTimeout time.Duration }
+
+// bindThresholds binds --older-than and --helm-timeout.
+func bindThresholds(fs *flag.FlagSet) (older, helm *durationFlag) {
+	older = newDurationFlag(DefaultOlderThan)
+	helm = newDurationFlag(DefaultHelmTimeout)
+	fs.Var(older, "older-than", "")
+	fs.Var(helm, "helm-timeout", "")
+	return older, helm
+}
+
+// planContext builds the plan.Context that repeats the flags the user passed, so every
+// printed command acts on the same cluster, storage and thresholds.
+func planContext(env Env, fs *flag.FlagSet, g Global) plan.Context {
+	return plan.Context{
+		Tool:      env.Tool,
+		Flags:     passthrough(fs, "older-than", "helm-timeout", "kube-context", "kubeconfig", "driver"),
+		HelmFlags: passthrough(fs, "kube-context", "kubeconfig"),
+		Driver:    g.Driver,
+	}
 }
 
 // durationFlag is a time.Duration flag that remembers how the user spelled it, so the

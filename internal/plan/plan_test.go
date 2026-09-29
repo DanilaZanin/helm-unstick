@@ -156,3 +156,66 @@ func TestRecommend(t *testing.T) {
 		}
 	}
 }
+
+func TestManualCommandsKeepTheClusterSelection(t *testing.T) {
+	c := Context{
+		Tool:      "helm-unstick",
+		Flags:     []string{"--kube-context staging", "--kubeconfig /tmp/kc"},
+		HelmFlags: []string{"--kube-context staging", "--kubeconfig /tmp/kc"},
+		Driver:    "configmap",
+	}
+	got := lines(Build(stuck(rev(1, model.StatusDeployed), rev(2, model.StatusPendingUpgrade)), FirstInstallNone, c))
+	want := "HELM_DRIVER=configmap helm rollback web 1 -n prod --kube-context staging --kubeconfig /tmp/kc\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("the manual rollback would run against another cluster or storage:\n%s\nwant line %q", got, want)
+	}
+	got = lines(Build(stuck(rev(1, model.StatusPendingInstall)), FirstInstallUninstall, c))
+	want = "HELM_DRIVER=configmap helm uninstall web -n prod --kube-context staging --kubeconfig /tmp/kc\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("the manual uninstall would run against another cluster or storage:\n%s\nwant line %q", got, want)
+	}
+	// the default driver needs no prefix
+	got = lines(Build(stuck(rev(1, model.StatusDeployed), rev(2, model.StatusPendingUpgrade)), FirstInstallNone, Context{Tool: "helm-unstick", Driver: "secret"}))
+	if strings.Contains(got, "HELM_DRIVER") {
+		t.Errorf("secret is Helm's default and needs no HELM_DRIVER:\n%s", got)
+	}
+}
+
+func TestPlanForSupersededOnlyHistory(t *testing.T) {
+	s := stuck(rev(1, model.StatusSuperseded), rev(2, model.StatusSuperseded), rev(3, model.StatusPendingUpgrade))
+	p := Build(s, FirstInstallNone, ctx)
+	if p.Action != ActionChoose {
+		t.Fatalf("Action = %s: an automatic rollback to a superseded revision is a guess and must be explicit", p.Action)
+	}
+	got := lines(p)
+	if !strings.Contains(got, "helm-unstick fix web -n prod --to-revision 2\n") {
+		t.Errorf("the plan must offer --to-revision 2:\n%s", got)
+	}
+	if !strings.Contains(p.Summary, "superseded") {
+		t.Errorf("summary does not explain the interrupted write: %q", p.Summary)
+	}
+	warned := strings.Join(p.Warnings, "\n")
+	if !strings.Contains(warned, "2 earlier revisions") || !strings.Contains(warned, "uninstall") {
+		t.Errorf("uninstall must be flagged as destructive for a release with history:\n%s", warned)
+	}
+	// the explicit choice is honored
+	p = Build(s, FirstInstallNone, Context{Tool: "helm-unstick", ToRevision: 2})
+	if p.Action != ActionRollback || p.RollbackTo != 2 {
+		t.Errorf("--to-revision 2: Action = %s, RollbackTo = %d", p.Action, p.RollbackTo)
+	}
+	if !strings.Contains(lines(p), "--to-revision 2") {
+		t.Errorf("the printed fix command must repeat --to-revision:\n%s", lines(p))
+	}
+}
+
+func TestUninstallIsNotAnEqualOptionForLongHistory(t *testing.T) {
+	s := stuck(rev(1, model.StatusFailed), rev(2, model.StatusFailed), rev(3, model.StatusPendingUpgrade))
+	p := Build(s, FirstInstallNone, ctx)
+	if !strings.Contains(strings.Join(p.Warnings, "\n"), "2 earlier revisions") {
+		t.Errorf("no warning about deleting the history:\n%v", p.Warnings)
+	}
+	first := Build(stuck(rev(1, model.StatusPendingInstall)), FirstInstallNone, ctx)
+	if len(first.Warnings) != 0 {
+		t.Errorf("a first install has no history to lose: %v", first.Warnings)
+	}
+}

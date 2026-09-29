@@ -199,3 +199,33 @@ func TestHistoryLatest(t *testing.T) {
 		t.Errorf("Latest() = %+v, %v", got, ok)
 	}
 }
+
+func TestAnalyzeFindsSupersededWhenNothingIsDeployed(t *testing.T) {
+	// Helm marks the old revision superseded before it stores the new deployed one. An
+	// interruption in between leaves a history that once worked but has no deployed revision.
+	s := Analyze(History{Revisions: []Revision{rev(1, StatusSuperseded), rev(2, StatusSuperseded), rev(3, StatusPendingUpgrade)}})
+	if s == nil || s.Target != nil || s.HasRollbackTarget() {
+		t.Fatalf("there is no deployed revision: %+v", s)
+	}
+	if s.Superseded == nil || s.Superseded.Number != 2 {
+		t.Fatalf("Superseded = %+v, want revision 2", s.Superseded)
+	}
+	// a deployed revision, when there is one, wins and Superseded stays empty
+	s = Analyze(History{Revisions: []Revision{rev(1, StatusSuperseded), rev(2, StatusDeployed), rev(3, StatusPendingUpgrade)}})
+	if s.Superseded != nil {
+		t.Errorf("Superseded must only be set when no revision is deployed: %+v", s.Superseded)
+	}
+}
+
+func TestRollbackCandidate(t *testing.T) {
+	s := Analyze(History{Revisions: []Revision{rev(1, StatusFailed), rev(2, StatusSuperseded), rev(3, StatusDeployed), rev(4, StatusPendingUpgrade)}})
+	tests := []struct {
+		n  int
+		ok bool
+	}{{1, false}, {2, true}, {3, true}, {4, false}, {5, false}, {0, false}}
+	for _, tt := range tests {
+		if _, ok := s.RollbackCandidate(tt.n); ok != tt.ok {
+			t.Errorf("RollbackCandidate(%d) = %v, want %v", tt.n, ok, tt.ok)
+		}
+	}
+}

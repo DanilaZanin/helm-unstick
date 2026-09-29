@@ -3,6 +3,8 @@
 # the version in plugin.yaml into $HELM_PLUGIN_DIR/bin and verifies its checksum.
 #
 # HELM_UNSTICK_DRY_RUN=1 prints the download URL and exits.
+# HELM_UNSTICK_BINARY=/path/to/helm-unstick installs that binary instead of downloading a
+# release, for installing the plugin from a local checkout (CI does this).
 set -eu
 
 repo="DanilaZanin/helm-unstick"
@@ -24,6 +26,14 @@ case "$(uname -m)" in
   aarch64 | arm64) arch=arm64 ;;
   *) echo "helm-unstick: unsupported architecture $(uname -m)" >&2; exit 1 ;;
 esac
+
+if [ -n "${HELM_UNSTICK_BINARY:-}" ]; then
+  mkdir -p "$plugin_dir/bin"
+  # a local install links the plugin directory to the checkout, so the file may be the same one
+  [ "$HELM_UNSTICK_BINARY" -ef "$plugin_dir/bin/helm-unstick" ] || install -m 0755 "$HELM_UNSTICK_BINARY" "$plugin_dir/bin/helm-unstick"
+  echo "helm-unstick: installed $HELM_UNSTICK_BINARY to $plugin_dir/bin/helm-unstick" >&2
+  exit 0
+fi
 
 archive="helm-unstick_v${version}_${os}_${arch}.tar.gz"
 base="https://github.com/${repo}/releases/download/v${version}"

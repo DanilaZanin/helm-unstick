@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -20,15 +21,23 @@ Recovers a release stuck in a pending-* state. Acts only when the verdict is "st
   --dry-run              print the plan and change nothing
   -y, --yes              do not ask for confirmation
   --older-than DURATION  staleness threshold and recent-activity window (default 10m)
+  --helm-timeout DURATION  the --timeout your deploys pass to helm (default 5m). A live
+                         helm --wait may still be waiting on a not-ready Pod, volume, load
+                         balancer or rollout until the record is older than this plus 1m
   --force-unknown        act although liveness could not be verified. It never
                          overrides "possibly-running"
   --first-install MODE   what to do when there is no deployed revision to return to:
                          mark-failed  set the pending revision to failed and keep the resources
                          uninstall    remove the release and its history
                          Without it, fix only prints the plan
+  --to-revision N        roll back to this revision. Needed when the history has no
+                         deployed revision but has a superseded one (an operation was
+                         interrupted between Helm's two writes). Never chosen for you
   --strategy S           how to roll back a pending revision:
-                         auto (default)  try the rollback directly, and if Helm refuses while
-                                         the revision is untouched, mark it failed and retry
+                         auto (default)  try the rollback directly, and if Helm refuses it
+                                         with "another operation is in progress" while the
+                                         revision is untouched, mark it failed and retry.
+                                         Any other error is returned without further writes
                          direct          rollback only
                          mark-failed     mark the pending revision failed, then roll back
   --wait                 wait for the rollback/uninstall to become ready
@@ -40,7 +49,19 @@ Exit codes: 0 done, 1 error, 2 still stuck, waiting for your --first-install cho
 
 const interruptedReason = "Interrupted operation, marked failed by helm-unstick"
 
+var errInterrupted = errors.New("interrupted; nothing further was changed")
+
+// stillRunning returns errInterrupted once the user has asked the command to stop, so no
+// mutation starts after Ctrl-C or SIGTERM.
+func stillRunning(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return errInterrupted
+	}
+	return nil
+}
+
 type fixOptions struct {
+	toRevision   int
 	dryRun       bool
 	yes          bool
 	forceUnknown bool
@@ -54,12 +75,12 @@ func runFix(ctx context.Context, args []string, env Env, newBackend Factory) int
 		o        fixOptions
 		firstRaw string
 	)
-	older := newDurationFlag(DefaultOlderThan)
 	timeout := newDurationFlag(DefaultTimeout)
 	fs := newFlagSet("fix")
 	c.bind(fs)
-	fs.Var(older, "older-than", "")
+	older, helmTimeout := bindThresholds(fs)
 	fs.Var(timeout, "timeout", "")
+	fs.IntVar(&o.toRevision, "to-revision", 0, "")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "")
 	fs.BoolVar(&o.yes, "yes", false, "")
 	fs.BoolVar(&o.yes, "y", false, "")
@@ -106,8 +127,17 @@ func runFix(ctx context.Context, args []string, env Env, newBackend Factory) int
 		return ExitOK
 	}
 
-	a := assess(ctx, be, s, older.d, env.Now())
-	pctx := planContext(env, passthrough(fs, "older-than", "kube-context", "kubeconfig", "driver"))
+	th := thresholds{olderThan: older.d, helmTimeout: helmTimeout.d}
+	toRevisionGiven := false
+	fs.Visit(func(f *flag.Flag) { toRevisionGiven = toRevisionGiven || f.Name == "to-revision" })
+	if toRevisionGiven {
+		if _, ok := s.RollbackCandidate(o.toRevision); !ok {
+			return fail(env, "--to-revision %d is not a revision to roll back to: it must be a deployed or superseded revision older than the pending revision %d", o.toRevision, s.Pending.Number)
+		}
+	}
+	a := assess(ctx, be, s, th, env.Now())
+	pctx := planContext(env, fs, c.Global)
+	pctx.ToRevision = o.toRevision
 	p := plan.Build(s, mode, pctx)
 	report := render.Report{Stuck: s, Age: a.Age, OlderThan: older.d, Verdict: a.Result, Plan: p}
 	render.Summary(env.Stdout, report)
@@ -147,9 +177,27 @@ func runFix(ctx context.Context, args []string, env Env, newBackend Factory) int
 		}
 	}
 
+	// The confirmation can take minutes and a live helm can start or resume meanwhile: look at
+	// the history and at the cluster again, and act only if the verdict is unchanged.
 	fmt.Fprintln(env.Stdout)
-	if err := ensureUnchanged(ctx, be, s); err != nil {
+	if err := stillRunning(ctx); err != nil {
 		return fail(env, "%v", err)
+	}
+	s, err = ensureUnchanged(ctx, be, s)
+	if err != nil {
+		return fail(env, "%v", err)
+	}
+	again := assess(ctx, be, s, th, env.Now())
+	if err := stillRunning(ctx); err != nil {
+		return fail(env, "%v", err)
+	}
+	if okAgain, _ := again.Result.Allows(o.forceUnknown); !okAgain || again.Result.Verdict != a.Result.Verdict {
+		fmt.Fprintf(env.Stdout, "Refused:   the situation changed while helm-unstick was checking: the verdict was %s and is %s now. Nothing was changed.\n",
+			a.Result.Verdict, again.Result.Verdict)
+		for _, r := range again.Result.Reasons {
+			fmt.Fprintf(env.Stdout, "  - %s\n", r)
+		}
+		return ExitRefused
 	}
 	opts := model.ActionOptions{Wait: o.wait, Timeout: timeout.d}
 	if err := execute(ctx, env, be, s, p, o, opts); err != nil {
@@ -171,50 +219,54 @@ func confirm(env Env, question string) (bool, error) {
 	return false, nil
 }
 
-// ensureUnchanged re-reads the history right before acting. If anything wrote to the
-// release since the verdict, the verdict is void: a live operation may have started.
-func ensureUnchanged(ctx context.Context, be Backend, before *model.Stuck) error {
+// ensureUnchanged re-reads the history right before acting and returns the fresh snapshot.
+// If anything wrote to the release since the verdict, the verdict is void: a live operation
+// may have started.
+func ensureUnchanged(ctx context.Context, be Backend, before *model.Stuck) (*model.Stuck, error) {
 	h, err := be.History(ctx, before.Namespace, before.Release)
 	if err != nil {
-		return fmt.Errorf("re-reading release history before acting: %w", err)
+		return nil, fmt.Errorf("re-reading release history before acting: %w", err)
 	}
 	now := model.Analyze(h)
 	if now == nil ||
 		now.Pending.Number != before.Pending.Number ||
 		now.Pending.Status != before.Pending.Status ||
+		now.Pending.Version != before.Pending.Version ||
 		!now.Pending.LastActivity().Equal(before.Pending.LastActivity()) {
-		return errors.New("the release changed while helm-unstick was checking it (a new operation may have started); nothing was changed, run the command again")
+		return nil, errors.New("the release changed while helm-unstick was checking it (a new operation may have started); nothing was changed, run the command again")
 	}
-	return nil
+	return now, nil
 }
 
 func execute(ctx context.Context, env Env, be Backend, s *model.Stuck, p plan.Plan, o fixOptions, opts model.ActionOptions) error {
 	out := env.Stdout
+	if err := stillRunning(ctx); err != nil {
+		return err
+	}
 	switch p.Action {
 	case plan.ActionRollback:
 		fmt.Fprintf(out, "Rolling back %s to revision %d ...\n", s.Release, p.RollbackTo)
-		path, err := rollback(ctx, out, be, s, p.RollbackTo, o.strategy, opts)
+		created, path, err := rollback(ctx, out, be, s, p.RollbackTo, o.strategy, opts)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "Rollback path: %s\n", path)
-		latest, err := finishRollback(ctx, out, be, s)
-		if err != nil {
+		if err := finishRollback(ctx, out, be, s, created); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "Done. Release %s is deployed as revision %d (content of revision %d). The next helm upgrade can proceed.\n",
-			s.Release, latest.Number, p.RollbackTo)
+			s.Release, created, p.RollbackTo)
 	case plan.ActionMarkFailed:
 		fmt.Fprintf(out, "Marking revision %d of %s as failed ...\n", s.Pending.Number, s.Release)
-		if err := be.MarkFailed(ctx, s.Namespace, s.Release, s.Pending.Number, interruptedReason); err != nil {
+		if err := be.MarkFailed(ctx, s.Namespace, s.Release, s.Pending, interruptedReason); err != nil {
 			return fmt.Errorf("marking revision %d as failed: %w", s.Pending.Number, err)
 		}
 		latest, err := latestRevision(ctx, be, s)
 		if err != nil {
 			return err
 		}
-		if latest.Status != model.StatusFailed {
-			return fmt.Errorf("revision %d has status %s after marking it failed", latest.Number, latest.Status)
+		if latest.Number != s.Pending.Number || latest.Status != model.StatusFailed {
+			return fmt.Errorf("after marking revision %d failed the latest revision is %d with status %s: something else wrote to the release", s.Pending.Number, latest.Number, latest.Status)
 		}
 		fmt.Fprintf(out, "Done. Revision %d is failed. Run your usual helm upgrade --install now.\n", latest.Number)
 	case plan.ActionUninstall:
@@ -235,53 +287,86 @@ func execute(ctx context.Context, env Env, be Backend, s *model.Stuck, p plan.Pl
 	return nil
 }
 
-// rollback runs the rollback according to the strategy and reports which path worked.
-func rollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck, target int, strategy string, opts model.ActionOptions) (string, error) {
-	roll := func() error { return be.Rollback(ctx, s.Namespace, s.Release, target, opts) }
-	markFirst := func() error {
-		fmt.Fprintf(out, "Marking pending revision %d as failed first ...\n", s.Pending.Number)
-		if err := be.MarkFailed(ctx, s.Namespace, s.Release, s.Pending.Number, interruptedReason); err != nil {
-			return fmt.Errorf("marking revision %d as failed: %w", s.Pending.Number, err)
+// rollback runs the rollback according to the strategy. It returns the revision the rollback
+// created and which path worked.
+func rollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck, target int, strategy string, opts model.ActionOptions) (int, string, error) {
+	roll := func() (int, error) {
+		if err := stillRunning(ctx); err != nil {
+			return 0, err
+		}
+		return be.Rollback(ctx, s.Namespace, s.Release, target, opts)
+	}
+	markFirst := func(from model.Revision) error {
+		if err := stillRunning(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Marking pending revision %d as failed first ...\n", from.Number)
+		if err := be.MarkFailed(ctx, s.Namespace, s.Release, from, interruptedReason); err != nil {
+			return fmt.Errorf("marking revision %d as failed: %w", from.Number, err)
 		}
 		return nil
 	}
+	// wrote explains a rollback that failed after Helm had already stored a revision for it,
+	// for example because --wait timed out. Nothing is retried in that case.
+	wrote := func(created int, err error) error {
+		return fmt.Errorf("the rollback wrote revision %d but did not complete: %w; check \"helm history %s -n %s\" before doing anything else", created, err, s.Release, s.Namespace)
+	}
 	switch strategy {
 	case "direct":
-		if err := roll(); err != nil {
-			return "", fmt.Errorf("rollback failed: %w", err)
+		created, err := roll()
+		if created != 0 && err != nil {
+			return 0, "", wrote(created, err)
 		}
-		return "direct", nil
+		if err != nil {
+			return 0, "", fmt.Errorf("rollback failed: %w", err)
+		}
+		return created, "direct", nil
 	case "mark-failed":
-		if err := markFirst(); err != nil {
-			return "", err
+		if err := markFirst(s.Pending); err != nil {
+			return 0, "", err
 		}
-		if err := roll(); err != nil {
-			return "", fmt.Errorf("rollback failed after marking revision %d failed: %w", s.Pending.Number, err)
+		created, err := roll()
+		if created != 0 && err != nil {
+			return 0, "", wrote(created, err)
 		}
-		return "mark-failed-first", nil
+		if err != nil {
+			return 0, "", fmt.Errorf("rollback failed after marking revision %d failed: %w", s.Pending.Number, err)
+		}
+		return created, "mark-failed-first", nil
 	}
 
-	// auto: try the plain rollback, and fall back only while the record is still untouched.
-	err := roll()
+	// auto: try the plain rollback. Fall back to mark-failed only when Helm refused because of
+	// the pending revision and the record is still exactly as it was inspected.
+	created, err := roll()
 	if err == nil {
-		return "direct", nil
+		return created, "direct", nil
 	}
-	fmt.Fprintf(out, "Direct rollback failed: %v\n", err)
+	if created != 0 {
+		return 0, "", wrote(created, err)
+	}
+	if !errors.Is(err, model.ErrPending) {
+		return 0, "", fmt.Errorf("rollback failed: %w", err)
+	}
+	fmt.Fprintf(out, "Direct rollback refused: %v\n", err)
 	h, herr := be.History(ctx, s.Namespace, s.Release)
 	if herr != nil {
-		return "", fmt.Errorf("rollback failed (%w) and the history could not be re-read: %w", err, herr)
+		return 0, "", fmt.Errorf("rollback failed (%w) and the history could not be re-read: %w", err, herr)
 	}
 	cur := model.Analyze(h)
-	if cur == nil || cur.Pending.Number != s.Pending.Number || cur.Pending.Status != s.Pending.Status {
-		return "", fmt.Errorf("rollback failed and the release state changed meanwhile, so it was not retried: %w", err)
+	if cur == nil || cur.Pending.Number != s.Pending.Number || cur.Pending.Status != s.Pending.Status || cur.Pending.Version != s.Pending.Version {
+		return 0, "", fmt.Errorf("rollback was refused and the release history changed since it was inspected, so it was not retried: %w", err)
 	}
-	if err := markFirst(); err != nil {
-		return "", err
+	if err := markFirst(cur.Pending); err != nil {
+		return 0, "", err
 	}
-	if err := roll(); err != nil {
-		return "", fmt.Errorf("rollback failed again after marking revision %d failed: %w", s.Pending.Number, err)
+	created, err = roll()
+	if created != 0 && err != nil {
+		return 0, "", wrote(created, err)
 	}
-	return "direct rollback refused, mark-failed-first worked", nil
+	if err != nil {
+		return 0, "", fmt.Errorf("rollback failed again after marking revision %d failed: %w", s.Pending.Number, err)
+	}
+	return created, "direct rollback refused, mark-failed-first worked", nil
 }
 
 func latestRevision(ctx context.Context, be Backend, s *model.Stuck) (model.Revision, error) {
@@ -296,29 +381,40 @@ func latestRevision(ctx context.Context, be Backend, s *model.Stuck) (model.Revi
 	return latest, nil
 }
 
-// finishRollback checks that the release ended up deployed and clears pending revisions
-// the rollback left behind, so the history no longer shows an operation in progress.
-func finishRollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck) (model.Revision, error) {
+// finishRollback checks that the revision this run created is the head of the history and
+// deployed, then clears pending revisions the rollback left behind, so the history no longer
+// shows an operation in progress.
+func finishRollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck, created int) error {
+	if created <= 0 {
+		return errors.New("internal error: the rollback reported no revision number")
+	}
 	h, err := be.History(ctx, s.Namespace, s.Release)
 	if err != nil {
-		return model.Revision{}, fmt.Errorf("re-reading release history: %w", err)
+		return fmt.Errorf("re-reading release history: %w", err)
 	}
-	latest, ok := h.Latest()
+	head, ok := h.Latest()
 	if !ok {
-		return model.Revision{}, errors.New("release history is empty after the rollback")
+		return errors.New("release history is empty after the rollback")
 	}
-	if latest.Status != model.StatusDeployed {
-		return latest, fmt.Errorf("the rollback finished but the latest revision %d has status %s, not deployed", latest.Number, latest.Status)
+	if head.Number != created {
+		return fmt.Errorf("the rollback created revision %d, but the latest revision is %d (%s): a concurrent operation wrote to the release, check \"helm history %s -n %s\"",
+			created, head.Number, head.Status, s.Release, s.Namespace)
+	}
+	if head.Status != model.StatusDeployed {
+		return fmt.Errorf("the rollback finished but its revision %d has status %s, not deployed", head.Number, head.Status)
 	}
 	for _, r := range h.Revisions {
-		if !r.Status.IsPending() || r.Number >= latest.Number {
+		if !r.Status.IsPending() || r.Number >= created {
 			continue
 		}
-		if err := be.MarkFailed(ctx, s.Namespace, s.Release, r.Number, interruptedReason); err != nil {
+		if err := stillRunning(ctx); err != nil {
+			return err
+		}
+		if err := be.MarkFailed(ctx, s.Namespace, s.Release, r, interruptedReason); err != nil {
 			fmt.Fprintf(out, "Warning: revision %d is still %s and could not be marked failed: %v\n", r.Number, r.Status, err)
 			continue
 		}
 		fmt.Fprintf(out, "Revision %d was left %s by the interrupted operation and is now marked failed.\n", r.Number, r.Status)
 	}
-	return latest, nil
+	return nil
 }

@@ -8,6 +8,7 @@ package verdict
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/DanilaZanin/helm-unstick/internal/humanize"
@@ -34,6 +35,7 @@ const (
 	SignalRecentChange SignalKind = "recent-change"
 	SignalJobRunning   SignalKind = "job-running"
 	SignalRollout      SignalKind = "rollout-in-progress"
+	SignalNotReady     SignalKind = "not-ready"
 )
 
 // Signal is one positive sign that the operation may still be running.
@@ -41,6 +43,10 @@ type Signal struct {
 	Kind   SignalKind
 	Object string // for example Deployment/web
 	Detail string
+	// Bounded marks a signal that only says "Helm --wait may still be waiting on this
+	// object". Helm gives up after its --timeout, so the signal stops counting once the
+	// pending record is older than that timeout plus a grace period.
+	Bounded bool
 }
 
 func (s Signal) String() string { return s.Object + ": " + s.Detail }
@@ -56,10 +62,15 @@ type Evidence struct {
 
 // Input is what Decide needs.
 type Input struct {
-	Age       time.Duration // time since the pending revision was last written
-	OlderThan time.Duration // the --older-than threshold, also the recent-change window
-	Evidence  Evidence
+	Age         time.Duration // time since the pending revision was last written
+	OlderThan   time.Duration // the --older-than threshold, also the recent-change window
+	HelmTimeout time.Duration // the --timeout of the Helm run that may still be alive (--helm-timeout)
+	Evidence    Evidence
 }
+
+// HelmGrace is added to the Helm timeout before a not-ready object stops counting: it covers
+// clock skew and the moment Helm needs to notice the timeout and write its final record.
+const HelmGrace = time.Minute
 
 // Result is the verdict plus the human-readable reasons behind it.
 type Result struct {
@@ -85,9 +96,21 @@ func Decide(in Input) Result {
 	if skewed {
 		res.Reasons = append(res.Reasons, "the pending revision is timestamped in the future (clock skew between this machine and the cluster?)")
 	}
+	waitLimit := in.HelmTimeout + HelmGrace
+	var expired []string
 	for _, s := range in.Evidence.Signals {
-		running = true
-		res.Reasons = append(res.Reasons, s.String())
+		switch {
+		case s.Bounded && age >= waitLimit:
+			expired = append(expired, s.Object)
+		case s.Bounded:
+			running = true
+			res.Reasons = append(res.Reasons, fmt.Sprintf(
+				"%s [a live helm may still be waiting: the record is younger than --helm-timeout %s plus %s grace; set --helm-timeout to the --timeout of your deploy]",
+				s, humanize.Duration(in.HelmTimeout), humanize.Duration(HelmGrace)))
+		default:
+			running = true
+			res.Reasons = append(res.Reasons, s.String())
+		}
 	}
 	if running {
 		res.Verdict = PossiblyRunning
@@ -113,9 +136,13 @@ func Decide(in Input) Result {
 		res.Reasons = append(res.Reasons, fmt.Sprintf(
 			"none of the %d release objects found in the cluster changed in the last %s", in.Evidence.Checked, humanize.Duration(in.OlderThan)))
 	}
-	res.Reasons = append(res.Reasons,
-		"no Job or hook Pod of the release is running",
-		"no Deployment, StatefulSet or DaemonSet of the release is mid-rollout")
+	if len(expired) > 0 {
+		res.Reasons = append(res.Reasons, fmt.Sprintf(
+			"%s not ready, but the record is older than the Helm timeout (%s) plus grace, so any helm that waited on them has given up",
+			strings.Join(expired, ", "), humanize.Duration(in.HelmTimeout)))
+	} else {
+		res.Reasons = append(res.Reasons, "nothing Helm --wait would wait on (Pods, Jobs, rollouts, volumes, load balancers) is pending")
+	}
 	return res
 }
 
@@ -130,6 +157,6 @@ func (r Result) Allows(forceUnknown bool) (ok bool, why string) {
 		}
 		return false, "liveness could not be verified, so the release is left alone (--force-unknown overrides this for an unknown verdict)"
 	default:
-		return false, "the operation may still be running, so the release is left alone (no flag overrides this: wait, or raise --older-than only if you are sure)"
+		return false, "the operation may still be running, so the release is left alone (no flag overrides this: wait and run the command again)"
 	}
 }

@@ -30,6 +30,9 @@ func main() { os.Exit(run()) }
 func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first Ctrl-C the commands stop before their next write; a second one must be
+	// able to kill the process, so the signal handler is dropped once the context is done.
+	context.AfterFunc(ctx, stop)
 	env := app.Env{
 		Stdin:       os.Stdin,
 		Stdout:      os.Stdout,

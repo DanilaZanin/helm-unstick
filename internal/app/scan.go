@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/DanilaZanin/helm-unstick/internal/model"
-	"github.com/DanilaZanin/helm-unstick/internal/plan"
 	"github.com/DanilaZanin/helm-unstick/internal/render"
 	"github.com/DanilaZanin/helm-unstick/internal/verdict"
 )
@@ -21,8 +20,8 @@ type assessment struct {
 }
 
 // assess collects liveness evidence for a stuck release and decides the verdict.
-func assess(ctx context.Context, be Backend, s *model.Stuck, olderThan time.Duration, now time.Time) assessment {
-	ev, err := be.Inspect(ctx, s, now, olderThan)
+func assess(ctx context.Context, be Backend, s *model.Stuck, th thresholds, now time.Time) assessment {
+	ev, err := be.Inspect(ctx, s, now, th.olderThan)
 	if err != nil {
 		ev.Errors = append(ev.Errors, err.Error())
 	}
@@ -32,19 +31,23 @@ func assess(ctx context.Context, be Backend, s *model.Stuck, olderThan time.Dura
 	} else {
 		age = now.Sub(last)
 	}
-	res := verdict.Decide(verdict.Input{Age: age, OlderThan: olderThan, Evidence: ev})
+	res := verdict.Decide(verdict.Input{Age: age, OlderThan: th.olderThan, HelmTimeout: th.helmTimeout, Evidence: ev})
 	return assessment{Stuck: s, Age: age, Evidence: ev, Result: res}
 }
 
-const scanHelp = `Usage: scan [-n NAMESPACE | -A] [--older-than 10m] [-o table|json]
+const scanHelp = `Usage: scan [-n NAMESPACE | -A] [--older-than 10m] [--helm-timeout 5m] [-o table|json]
 
 Lists releases whose latest revision is pending-install, pending-upgrade or
-pending-rollback, with a liveness verdict for each. Exit code 2 when any is found.
+pending-rollback, with a liveness verdict for each. Exit code 2 when any is found, 1 when
+some release could not be read (the scan is incomplete and never reports "nothing stuck").
 
   -n, --namespace NS     namespace to scan (default: namespace of the kube context)
   -A, --all-namespaces   scan every namespace
   --older-than DURATION  pending records younger than this, and recent activity inside
                          this window, count as "possibly running" (default 10m)
+  --helm-timeout DURATION  the --timeout of your helm deploys (default 5m). Objects a live
+                         helm --wait would still wait on block the verdict until the record
+                         is older than this plus one minute
   -o, --output FORMAT    table (default) or json
 `
 
@@ -54,12 +57,11 @@ func runScan(ctx context.Context, args []string, env Env, newBackend Factory) in
 		all    bool
 		output string
 	)
-	older := newDurationFlag(DefaultOlderThan)
 	fs := newFlagSet("scan")
 	c.bind(fs)
 	fs.BoolVar(&all, "A", false, "")
 	fs.BoolVar(&all, "all-namespaces", false, "")
-	fs.Var(older, "older-than", "")
+	older, helmTimeout := bindThresholds(fs)
 	fs.StringVar(&output, "o", "table", "")
 	fs.StringVar(&output, "output", "table", "")
 	pos, err := parseInterspersed(fs, args)
@@ -86,19 +88,20 @@ func runScan(ctx context.Context, args []string, env Env, newBackend Factory) in
 	if ns == "" && !all {
 		ns = be.Namespace()
 	}
-	histories, err := be.ListPending(ctx, ns)
+	listing, err := be.ListPending(ctx, ns)
 	if err != nil {
 		return fail(env, "listing releases: %v", err)
 	}
 
 	now := env.Now()
+	th := thresholds{olderThan: older.d, helmTimeout: helmTimeout.d}
 	var rows []render.ScanRow
-	for _, h := range histories {
+	for _, h := range listing.Histories {
 		s := model.Analyze(h)
 		if s == nil {
 			continue
 		}
-		a := assess(ctx, be, s, older.d, now)
+		a := assess(ctx, be, s, th, now)
 		rows = append(rows, render.NewScanRow(s, a.Age, a.Result))
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -113,26 +116,28 @@ func runScan(ctx context.Context, args []string, env Env, newBackend Factory) in
 			return fail(env, "writing output: %v", err)
 		}
 	} else {
-		if len(rows) == 0 {
+		if len(rows) == 0 && len(listing.Problems) == 0 {
 			where := "namespace " + ns
 			if all {
 				where = "any namespace"
 			}
 			fmt.Fprintf(env.Stdout, "No release is stuck in a pending-* state in %s.\n", where)
-		} else {
+		} else if len(rows) > 0 {
 			if err := render.ScanTable(env.Stdout, rows); err != nil {
 				return fail(env, "writing output: %v", err)
 			}
 			fmt.Fprintf(env.Stdout, "\nRun \"%s explain RELEASE -n NAMESPACE\" for the reasons and the recovery plan.\n", env.Tool)
 		}
 	}
+	if len(listing.Problems) > 0 {
+		for _, p := range listing.Problems {
+			fmt.Fprintf(env.Stderr, "Error: cannot read release %s/%s: %s\n", p.Namespace, p.Release, p.Err)
+		}
+		fmt.Fprintf(env.Stderr, "Error: the scan is incomplete: %d release(s) could not be read, so \"nothing is stuck\" cannot be claimed\n", len(listing.Problems))
+		return ExitError
+	}
 	if len(rows) > 0 {
 		return ExitStuck
 	}
 	return ExitOK
-}
-
-// planContext builds the plan.Context that repeats the flags the user passed.
-func planContext(env Env, extra []string) plan.Context {
-	return plan.Context{Tool: env.Tool, Flags: extra}
 }
