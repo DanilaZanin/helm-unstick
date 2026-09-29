@@ -147,10 +147,12 @@ func TestBoundedSignalsExpireWithHelmTimeout(t *testing.T) {
 		want Verdict
 	}{
 		{"inside the Helm timeout", Input{Age: 3 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
-		{"inside the grace period", Input{Age: 5*time.Minute + 30*time.Second, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
-		{"past timeout and grace", Input{Age: 7 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, Stale},
-		{"past the timeout but younger than --older-than", Input{Age: 7 * time.Minute, OlderThan: 10 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
-		{"a longer Helm timeout keeps blocking", Input{Age: 7 * time.Minute, HelmTimeout: 30 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
+		{"one timeout plus grace is not enough: helm applies --timeout per phase", Input{Age: 6*time.Minute + 30*time.Second, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
+		{"pre-hook 5m, wait 5m, post-hook 5m", Input{Age: 15 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
+		{"exactly 3 timeouts plus grace still blocks", Input{Age: 16 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
+		{"past 3 timeouts and grace", Input{Age: 16*time.Minute + time.Second, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, Stale},
+		{"past the window but younger than --older-than", Input{Age: 17 * time.Minute, OlderThan: time.Hour, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
+		{"a longer Helm timeout keeps blocking", Input{Age: 17 * time.Minute, HelmTimeout: 30 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}}, PossiblyRunning},
 		{"an unbounded signal never expires", Input{Age: 5 * time.Hour, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{{Kind: SignalRecentChange, Object: "ConfigMap/x", Detail: "modified 1s ago"}}}}, PossiblyRunning},
 	}
 	for _, tt := range tests {
@@ -161,7 +163,7 @@ func TestBoundedSignalsExpireWithHelmTimeout(t *testing.T) {
 			}
 		})
 	}
-	stale := Decide(Input{Age: 7 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}})
+	stale := Decide(Input{Age: 17 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}})
 	joined := strings.Join(stale.Reasons, "\n")
 	if !strings.Contains(joined, "Deployment/web") || !strings.Contains(joined, "given up") {
 		t.Errorf("a stale verdict must say which not-ready objects it disregarded and why:\n%s", joined)
@@ -169,6 +171,20 @@ func TestBoundedSignalsExpireWithHelmTimeout(t *testing.T) {
 	running := Decide(Input{Age: 3 * time.Minute, HelmTimeout: 5 * time.Minute, Evidence: Evidence{Signals: []Signal{wait}}})
 	if !strings.Contains(strings.Join(running.Reasons, "\n"), "--helm-timeout") {
 		t.Errorf("a blocking wait signal must point at --helm-timeout: %v", running.Reasons)
+	}
+}
+
+func TestActiveHookNeverExpires(t *testing.T) {
+	hook := Signal{Kind: SignalJobRunning, Object: "Job/migrate", Detail: "hook has not finished: 1 active pod(s)", Permanent: true}
+	for _, age := range []time.Duration{time.Minute, time.Hour, 500 * time.Hour} {
+		got := Decide(Input{Age: age, OlderThan: 0, HelmTimeout: time.Second, Evidence: Evidence{Signals: []Signal{hook}}})
+		if got.Verdict != PossiblyRunning {
+			t.Fatalf("age %s: Verdict = %s, want possibly-running: a running hook is real work whatever the timeout", age, got.Verdict)
+		}
+		joined := strings.Join(got.Reasons, "\n")
+		if !strings.Contains(joined, "Job/migrate") || !strings.Contains(joined, "wait for it to finish or delete the hook") {
+			t.Errorf("age %s: the refusal must tell the user to wait or delete the hook Job:\n%s", age, joined)
+		}
 	}
 }
 

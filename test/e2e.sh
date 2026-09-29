@@ -11,7 +11,8 @@
 #   UNSTICK                  binary under test (default: bin/helm-unstick, build it with make build)
 #   E2E_USE_CURRENT_CONTEXT  1 = use the current kube context, do not create or delete a cluster
 #   E2E_CLUSTER              kind cluster name (default: helm-unstick-e2e)
-#   E2E_ONLY                 space-separated scenario names to run (default: all), for example "live_wait plugin"
+#   E2E_ONLY                 space-separated scenario names to run (default: all), for example "live_wait plugin".
+#                            An unknown name, or a list that selects nothing, fails the run
 #   KEEP_CLUSTER             1 = keep the kind cluster afterwards
 set -euo pipefail
 
@@ -44,6 +45,13 @@ cleanup() {
   exit "$code"
 }
 trap cleanup EXIT
+
+# Scenario names, in the order they run. E2E_ONLY picks from them.
+SCENARIOS="upgrade live install rollback live_wait loadbalancer undecodable hook plugin"
+SELECTED=0
+for name in ${E2E_ONLY:-}; do
+  [[ " $SCENARIOS " == *" $name "* ]] || die "E2E_ONLY names an unknown scenario '$name' (known: $SCENARIOS)"
+done
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 need kubectl
@@ -460,10 +468,59 @@ YAML
 
 # ---------------------------------------------------------------- scenario 8
 
-# The plugin installs from a local checkout on this Helm generation and runs.
+# A pre-upgrade hook Job that is still running is real work: no timeout ends it, and killing
+# helm does not stop it. fix must refuse for as long as it runs, also when the record is older
+# than any helm --timeout could explain. Once the Job is done the release is stale again.
+scenario_active_hook() {
+  local ns=e2e-s8 rel=web
+  log "scenario 8: pre-upgrade hook Job that is still running"
+  new_namespace "$ns"
+  "$HELM" install "$rel" "$CHART" -n "$ns" --wait --timeout 3m --set rollout=1 >/dev/null
+
+  start_bg "$HELM" upgrade "$rel" "$CHART" -n "$ns" --wait --timeout 10m --set rollout=2 --set hookSleep=100
+  wait_status "$ns" "$rel" pending-upgrade 60
+  wait_for 60 "the hook Job to have an active pod" bash -c \
+    "[[ \$(kubectl -n '$ns' get jobs -o jsonpath='{.items[0].status.active}' 2>/dev/null) == 1 ]]"
+  kill_bg # the CI job dies, the hook Job keeps running
+
+  run "$UNSTICK" scan -n "$ns" --older-than 0s --helm-timeout 1m -o json
+  [[ "$(jq -r '.[0].verdict' <<<"$OUT")" == possibly-running ]] || die "scenario 8: expected possibly-running, got: $OUT"
+  grep -qF "hook has not finished" <<<"$OUT" || die "scenario 8: the verdict must name the hook Job: $OUT"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 1m --yes
+  expect_rc 3 "fix while the hook Job runs"
+  expect_out "delete the hook" "the refusal says what to do"
+  pass "fix refuses with exit 3 while the hook Job is active"
+
+  # 3 x 1s + 1m grace = 63s: past that no helm-timeout signal would count, the running hook still does
+  wait_for 90 "the hook Job to run longer than the wait window" bash -c \
+    "created=\$(kubectl -n '$ns' get jobs -o jsonpath='{.items[0].metadata.creationTimestamp}'); jq -en --arg t \"\$created\" '(now - (\$t | fromdateiso8601)) > 66' >/dev/null"
+  [[ "$(kubectl -n "$ns" get jobs -o jsonpath='{.items[0].status.active}')" == 1 ]] || die "scenario 8: the hook Job finished too early for this check"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 1s --yes
+  expect_rc 3 "fix with a record older than the wait window while the hook Job runs"
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 1s --yes --force-unknown
+  expect_rc 3 "fix --force-unknown while the hook Job runs"
+  [[ "$(latest_status "$ns" "$rel")" == pending-upgrade ]] || die "fix touched a release whose hook is running"
+  pass "a running hook never expires with the helm timeout, and --force-unknown does not override it"
+
+  wait_for 120 "the hook Job to finish" kubectl -n "$ns" wait --for=condition=complete job --all --timeout=5s
+  run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 1s --yes
+  expect_rc 0 "fix after the hook Job finished"
+  [[ "$(latest_status "$ns" "$rel")" == deployed ]] || die "release is not deployed after fix"
+  [[ "$(deployed_rollout "$ns" "$rel")" == 1 ]] || die "fix did not restore revision 1"
+  pass "fix recovers once the hook Job is done"
+
+  expect_helm_works "$ns" "$rel" 3
+  drop_namespace "$ns"
+}
+
+# ---------------------------------------------------------------- scenario 9
+
+# The plugin works on this Helm generation: installed from a local checkout, installed through
+# the release-download path of the install hook (a local file:// "release"), and the commands
+# it prints keep what Helm consumed from the command line.
 scenario_plugin() {
-  log "scenario 8: helm plugin install from the local directory"
-  local data=$WORK/helm-data
+  local ns=e2e-s9 rel=web data=$WORK/helm-data
+  log "scenario 9: helm plugin"
   mkdir -p "$data"
   run env HELM_DATA_HOME="$data" HELM_UNSTICK_BINARY="$UNSTICK" "$HELM" plugin install "$ROOT"
   expect_rc 0 "helm plugin install"
@@ -473,11 +530,52 @@ scenario_plugin() {
   expect_rc 0 "helm unstick scan"
   expect_out "No release is stuck" "helm unstick scan"
   pass "helm $HELM_MAJOR installs the plugin from the local directory and helm unstick scan runs"
+
+  # the download path of the install hook, against a release laid out like the GitHub one
+  local version os arch archive src=$WORK/plugin-src rel_dir=$WORK/release data2=$WORK/helm-data-download
+  version=$(sed -n 's/^version:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' "$ROOT/plugin.yaml" | head -n1)
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; *) arch=arm64 ;; esac
+  archive="helm-unstick_v${version}_${os}_${arch}.tar.gz"
+  mkdir -p "$src" "$rel_dir" "$data2"
+  cp -R "$ROOT/plugin.yaml" "$ROOT/scripts" "$src/"
+  tar -czf "$rel_dir/$archive" -C "$(dirname "$UNSTICK")" "$(basename "$UNSTICK")"
+  (cd "$rel_dir" && { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$archive"; else shasum -a 256 "$archive"; fi; } >checksums.txt)
+  # the archive holds the binary under the name helm-unstick, as the goreleaser archives do
+  [[ "$(basename "$UNSTICK")" == helm-unstick ]] || die "the binary under test must be called helm-unstick for the download path check"
+  run env HELM_DATA_HOME="$data2" HELM_UNSTICK_BASE_URL="file://$rel_dir" "$HELM" plugin install "$src"
+  expect_rc 0 "helm plugin install through the download path"
+  expect_out "installed $version" "the hook installs the downloaded release"
+  run env HELM_DATA_HOME="$data2" "$HELM" unstick version
+  expect_rc 0 "the downloaded plugin runs"
+  printf 'bad  %s\n' "$archive" >"$rel_dir/checksums.txt"
+  run env HELM_DATA_HOME="$WORK/helm-data-bad" HELM_UNSTICK_BASE_URL="file://$rel_dir" "$HELM" plugin install "$src"
+  [[ "$RC" != 0 ]] || die "a wrong checksum must fail the install hook"
+  pass "the install hook downloads, verifies and installs a release archive"
+
+  # commands printed under the plugin must keep --kube-context, and --driver must beat HELM_DRIVER
+  new_namespace "$ns"
+  "$HELM" install "$rel" "$CHART" -n "$ns" --wait --timeout 3m --set rollout=1 >/dev/null
+  start_bg "$HELM" upgrade "$rel" "$CHART" -n "$ns" --wait --timeout 10m --set rollout=2 --set readinessDelay=60
+  wait_status "$ns" "$rel" pending-upgrade 60
+  kill_bg
+  local ctx
+  ctx=$(kubectl config current-context)
+  run env HELM_DATA_HOME="$data" HELM_DRIVER=configmap "$HELM" unstick explain "$rel" -n "$ns" --older-than 0s --kube-context "$ctx" --driver secret
+  expect_rc 0 "helm unstick explain"
+  expect_out "HELM_DRIVER=secret helm rollback $rel 1 -n $ns --kube-context $ctx" "explain under the plugin: the manual rollback"
+  expect_out "helm unstick fix $rel -n $ns" "explain under the plugin: the fix command"
+  grep -F "helm unstick fix $rel" <<<"$OUT" | grep -qF -- "--kube-context $ctx" || die "the printed helm unstick fix lost --kube-context"
+  pass "under helm unstick, printed commands keep --kube-context and an explicit --driver"
+  drop_namespace "$ns"
 }
 
 # ---------------------------------------------------------------- run
 
-want() { [[ -z "${E2E_ONLY:-}" || " $E2E_ONLY " == *" $1 "* ]]; }
+want() {
+  [[ -z "${E2E_ONLY:-}" || " $E2E_ONLY " == *" $1 "* ]] || return 1
+  SELECTED=$((SELECTED + 1))
+}
 
 if want upgrade; then
   scenario_interrupted_upgrade auto
@@ -493,7 +591,10 @@ if want rollback; then scenario_interrupted_rollback; fi
 if want live_wait; then scenario_live_wait_after_deadline; fi
 if want loadbalancer; then scenario_live_wait_loadbalancer; fi
 if want undecodable; then scenario_undecodable_record; fi
+if want hook; then scenario_active_hook; fi
 if want plugin; then scenario_plugin; fi
+
+((SELECTED > 0)) || die "no scenario was selected (E2E_ONLY='${E2E_ONLY:-}'; known: $SCENARIOS)"
 
 log "findings (paste into the README section on rollback behavior)"
 for f in ${FINDINGS[@]+"${FINDINGS[@]}"}; do printf '  - %s\n' "$f"; done

@@ -63,7 +63,12 @@ type Context struct {
 	Flags []string // extra flags to repeat, for example "--older-than 15m"
 	// HelmFlags select the cluster for the plain helm commands (--kube-context, --kubeconfig).
 	HelmFlags []string
-	// Driver is the Helm storage driver; helm commands get HELM_DRIVER=... unless it is the default.
+	// EnvPrefix are VAR=value words put before every printed command, for settings that cannot
+	// be flags (a KUBECONFIG list).
+	EnvPrefix []string
+	// Driver is the storage driver the user chose with --driver, "" when they did not. Helm
+	// commands get HELM_DRIVER=... whenever it is set, even to the default, because an
+	// inherited HELM_DRIVER would otherwise win in the pasted command.
 	Driver string
 	// ToRevision is the rollback target the user chose with --to-revision, 0 when none.
 	ToRevision int
@@ -71,10 +76,8 @@ type Context struct {
 
 // helmCommand spells a plain helm command so it acts on the same cluster and storage.
 func (c Context) helmCommand(args ...string) string {
-	var parts []string
-	switch c.Driver {
-	case "", "secret", "secrets":
-	default:
+	parts := append([]string(nil), c.EnvPrefix...)
+	if c.Driver != "" {
 		parts = append(parts, "HELM_DRIVER="+c.Driver)
 	}
 	parts = append(parts, "helm")
@@ -84,7 +87,8 @@ func (c Context) helmCommand(args ...string) string {
 }
 
 func (c Context) fixCommand(s *model.Stuck, extra ...string) string {
-	parts := []string{c.Tool, "fix", s.Release, "-n", s.Namespace}
+	parts := append([]string(nil), c.EnvPrefix...)
+	parts = append(parts, c.Tool, "fix", s.Release, "-n", s.Namespace)
 	parts = append(parts, c.Flags...)
 	parts = append(parts, extra...)
 	return strings.Join(parts, " ")

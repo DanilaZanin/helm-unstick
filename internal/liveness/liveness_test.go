@@ -237,6 +237,54 @@ func TestHookPod(t *testing.T) {
 	}
 }
 
+func TestActiveHookWorkIsPermanentButOtherSignalsAreBounded(t *testing.T) {
+	tests := []struct {
+		name      string
+		ref       Ref
+		json      string
+		permanent bool
+		bounded   bool
+	}{
+		{"hook Job with active pods", Ref{Kind: "Job", Name: "j", Hook: true}, `{"status":{"active":1}}`, true, false},
+		{"hook Job that only started", Ref{Kind: "Job", Name: "j", Hook: true}, `{"status":{}}`, false, true},
+		{"running hook Pod", Ref{Kind: "Pod", Name: "p", Hook: true}, `{"status":{"phase":"Running"}}`, true, false},
+		{"pending hook Pod", Ref{Kind: "Pod", Name: "p", Hook: true}, `{"status":{"phase":"Pending"}}`, false, true},
+		{"active Job of the manifest, not a hook", Ref{Kind: "Job", Name: "j"}, `{"status":{"active":1}}`, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sigs := Inspect(tt.ref, obj(t, tt.json), now, 0)
+			if len(sigs) != 1 || sigs[0].Permanent != tt.permanent || sigs[0].Bounded != tt.bounded {
+				t.Fatalf("signals = %+v, want permanent=%v bounded=%v", sigs, tt.permanent, tt.bounded)
+			}
+		})
+	}
+}
+
+func TestReplicationControllerReadiness(t *testing.T) {
+	rc := Ref{APIVersion: "v1", Kind: "ReplicationController", Name: "rc"}
+	tests := []struct {
+		name string
+		json string
+		busy bool
+	}{
+		{"controller has not seen the spec", `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":1,"readyReplicas":2}}`, true},
+		{"replicas not ready", `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"readyReplicas":1}}`, true},
+		{"ready", `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"readyReplicas":2}}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sigs := Inspect(rc, obj(t, tt.json), now, 0)
+			if got := hasKind(sigs, verdict.SignalNotReady); got != tt.busy {
+				t.Fatalf("not-ready = %v, want %v (%v)", got, tt.busy, sigs)
+			}
+			if tt.busy && !sigs[0].Bounded {
+				t.Error("a Helm-wait signal must be bounded")
+			}
+		})
+	}
+}
+
 func TestRecentChange(t *testing.T) {
 	stamp := func(ago time.Duration) string { return now.Add(-ago).Format(time.RFC3339) }
 	withFields := func(entries ...string) string {

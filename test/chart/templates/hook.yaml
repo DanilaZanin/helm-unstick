@@ -1,0 +1,19 @@
+{{- if .Values.hookSleep }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-prehook
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: hook
+          image: {{ .Values.image }}
+          command: ["sh", "-c", "sleep {{ .Values.hookSleep }}"]
+{{- end }}

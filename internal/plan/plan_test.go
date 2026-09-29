@@ -174,10 +174,15 @@ func TestManualCommandsKeepTheClusterSelection(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Errorf("the manual uninstall would run against another cluster or storage:\n%s\nwant line %q", got, want)
 	}
-	// the default driver needs no prefix
+	// an explicit --driver secret must beat an inherited HELM_DRIVER in the pasted command
 	got = lines(Build(stuck(rev(1, model.StatusDeployed), rev(2, model.StatusPendingUpgrade)), FirstInstallNone, Context{Tool: "helm-unstick", Driver: "secret"}))
+	if !strings.Contains(got, "HELM_DRIVER=secret helm rollback") {
+		t.Errorf("an explicit secret driver must be spelled out:\n%s", got)
+	}
+	// no --driver: whatever the shell has already applies
+	got = lines(Build(stuck(rev(1, model.StatusDeployed), rev(2, model.StatusPendingUpgrade)), FirstInstallNone, Context{Tool: "helm-unstick"}))
 	if strings.Contains(got, "HELM_DRIVER") {
-		t.Errorf("secret is Helm's default and needs no HELM_DRIVER:\n%s", got)
+		t.Errorf("no --driver, no HELM_DRIVER prefix:\n%s", got)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,12 +28,13 @@ type Client struct {
 	settings *cli.EnvSettings
 	driver   string
 
-	kube *kubeAccess // created on first use
+	kube   *kubeAccess // created on first use
+	stderr io.Writer   // where the interrupt notice goes
 }
 
 // New returns a Client. driverName is the Helm storage driver ("" means secret).
 func New(settings *cli.EnvSettings, driverName string) *Client {
-	return &Client{settings: settings, driver: driverName}
+	return &Client{settings: settings, driver: driverName, stderr: os.Stderr}
 }
 
 // Namespace is the namespace of the kube context unless the user chose another.
@@ -87,8 +90,9 @@ func (c *Client) ListPending(ctx context.Context, namespace string) (model.Listi
 	return out, nil
 }
 
-// History returns every stored revision of one release. Records the SDK cannot decode make
-// it fail: a history with a hidden revision is not something to act on.
+// History returns every stored revision of one release, built from a single snapshot of its
+// storage records. Records that cannot be decoded, or that contradict their own labels, make
+// it fail: a history with a hidden or doubtful revision is not something to act on.
 func (c *Client) History(ctx context.Context, namespace, name string) (model.History, error) {
 	if err := ctx.Err(); err != nil {
 		return model.History{}, err
@@ -100,41 +104,7 @@ func (c *Client) History(ctx context.Context, namespace, name string) (model.His
 	if err != nil {
 		return model.History{}, err
 	}
-	recs, err := listRecords(ctx, kube.kc, c.driver, namespace, "owner=helm,name="+name)
-	if err != nil {
-		return model.History{}, fmt.Errorf("listing the storage records of %q: %w", name, err)
-	}
-	if len(recs) == 0 {
-		return model.History{}, fmt.Errorf("release %q not found in namespace %q: %w", name, namespace, model.ErrNotFound)
-	}
-	cfg, err := c.config(namespace)
-	if err != nil {
-		return model.History{}, err
-	}
-	rels, err := cfg.Releases.History(name)
-	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
-		return model.History{}, fmt.Errorf("reading history of %q: %w", name, err)
-	}
-	byNumber := map[int]record{}
-	for _, r := range recs {
-		if n, ok := r.revision(); ok {
-			byNumber[n] = r
-		}
-	}
-	decoded := map[int]bool{}
-	h := model.History{Namespace: namespace, Release: name}
-	for _, rel := range rels {
-		decoded[rel.Version] = true
-		rev := toRevision(rel)
-		if rec, ok := byNumber[rel.Version]; ok {
-			rev.ModifiedAt, rev.Version = rec.Written, rec.Version
-		}
-		h.Revisions = append(h.Revisions, rev)
-	}
-	if err := checkDecoded(recs, decoded); err != nil {
-		return model.History{}, fmt.Errorf("release %q: %w", name, err)
-	}
-	return h, nil
+	return readHistory(ctx, kube.kc, c.driver, namespace, name)
 }
 
 func toRevision(rel *release.Release) model.Revision {
@@ -177,23 +147,33 @@ func (r *recorder) last() int {
 	return r.created[len(r.created)-1]
 }
 
-// runCtx runs a Helm SDK call, which takes no context, and gives up waiting for it when ctx
-// ends. The call may still finish in the background until the process exits, which is why
-// the error says so.
-func runCtx(ctx context.Context, what string, fn func() error) error {
+// runCtx runs a Helm SDK call, which takes no context and cannot be stopped half-way. The
+// first interrupt therefore does not abandon it: an abandoned rollback would go on writing in
+// a goroutine while the command reported an error. The call is allowed to finish, the user is
+// told so, and a second Ctrl-C (the signal handler is gone by then) kills the process.
+func (c *Client) runCtx(ctx context.Context, what string, fn func() error) error {
 	done := make(chan error, 1)
 	go func() { done <- fn() }()
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		return fmt.Errorf("%s: interrupted while Helm was working; it may have partly completed, check helm history: %w", what, ctx.Err())
+		fmt.Fprintf(c.stderr, "\nInterrupt received: finishing the current write (%s), press Ctrl-C again to abort. Aborting can leave a half-written release; check helm history afterwards.\n", what)
+		return <-done
 	}
 }
 
 // Rollback rolls the release back to a revision with the SDK and returns the revision it created.
-func (c *Client) Rollback(ctx context.Context, namespace, name string, revision int, opts model.ActionOptions) (int, error) {
+//
+// from is the head revision as it was inspected. Immediately before the SDK call its storage
+// record is read again and must have the same status and resourceVersion, otherwise nothing is
+// written. The SDK takes no precondition, so a small window remains between that read and the
+// SDK's own first write: a helm that starts inside it is not seen.
+func (c *Client) Rollback(ctx context.Context, namespace, name string, from model.Revision, revision int, opts model.ActionOptions) (int, error) {
 	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := c.guard(ctx, namespace, name, from); err != nil {
 		return 0, err
 	}
 	cfg, err := c.config(namespace)
@@ -206,7 +186,7 @@ func (c *Client) Rollback(ctx context.Context, namespace, name string, revision 
 	rb.Version = revision
 	rb.Wait = opts.Wait
 	rb.Timeout = opts.Timeout
-	err = runCtx(ctx, "rollback", func() error { return rb.Run(name) })
+	err = c.runCtx(ctx, "rollback", func() error { return rb.Run(name) })
 	if err != nil {
 		// Helm's refusal text is not an exported error value.
 		if msg := err.Error(); strings.Contains(msg, "another operation") && strings.Contains(msg, "in progress") {
@@ -218,10 +198,23 @@ func (c *Client) Rollback(ctx context.Context, namespace, name string, revision 
 
 // MarkFailed sets one pending revision to failed, conditional on its storage record being
 // exactly the one that was inspected.
-func (c *Client) MarkFailed(ctx context.Context, namespace, name string, from model.Revision, reason string) error {
+// It returns the revision as it is stored afterwards (failed, with its new record version).
+func (c *Client) MarkFailed(ctx context.Context, namespace, name string, from model.Revision, reason string) (model.Revision, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return model.Revision{}, err
 	}
+	if err := c.checkDriver(); err != nil {
+		return model.Revision{}, err
+	}
+	kube, err := c.access()
+	if err != nil {
+		return model.Revision{}, err
+	}
+	return markRecordFailed(ctx, kube.kc, c.driver, namespace, name, from, reason, time.Now())
+}
+
+// guard re-reads the record of from right before an SDK write.
+func (c *Client) guard(ctx context.Context, namespace, name string, from model.Revision) error {
 	if err := c.checkDriver(); err != nil {
 		return err
 	}
@@ -229,12 +222,16 @@ func (c *Client) MarkFailed(ctx context.Context, namespace, name string, from mo
 	if err != nil {
 		return err
 	}
-	return markRecordFailed(ctx, kube.kc, c.driver, namespace, name, from, reason, time.Now())
+	return guardRecord(ctx, kube.kc, c.driver, namespace, name, from)
 }
 
-// Uninstall removes the release together with its history.
-func (c *Client) Uninstall(ctx context.Context, namespace, name string, opts model.ActionOptions) error {
+// Uninstall removes the release together with its history. from is guarded like the one of
+// Rollback.
+func (c *Client) Uninstall(ctx context.Context, namespace, name string, from model.Revision, opts model.ActionOptions) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.guard(ctx, namespace, name, from); err != nil {
 		return err
 	}
 	cfg, err := c.config(namespace)
@@ -244,5 +241,5 @@ func (c *Client) Uninstall(ctx context.Context, namespace, name string, opts mod
 	un := action.NewUninstall(cfg)
 	un.Wait = opts.Wait
 	un.Timeout = opts.Timeout
-	return runCtx(ctx, "uninstall", func() error { _, err := un.Run(name); return err })
+	return c.runCtx(ctx, "uninstall", func() error { _, err := un.Run(name); return err })
 }

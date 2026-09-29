@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -54,7 +53,7 @@ func pending(version string) model.Revision {
 
 func TestMarkRecordFailedRewritesOnlyTheStatus(t *testing.T) {
 	kc := fake.NewSimpleClientset(secretRecord(t, "42", "pending-upgrade"))
-	if err := markRecordFailed(context.Background(), kc, "", "prod", "web", pending("42"), "interrupted", clock); err != nil {
+	if _, err := markRecordFailed(context.Background(), kc, "", "prod", "web", pending("42"), "interrupted", clock); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := kc.CoreV1().Secrets("prod").Get(context.Background(), "sh.helm.release.v1.web.v3", metav1.GetOptions{})
@@ -94,7 +93,7 @@ func TestMarkRecordFailedNeverOverwritesARecordThatMoved(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			kc := fake.NewSimpleClientset(tt.rec.DeepCopy())
-			err := markRecordFailed(ctx, kc, "", "prod", "web", tt.from, "x", clock)
+			_, err := markRecordFailed(ctx, kc, "", "prod", "web", tt.from, "x", clock)
 			if err == nil || (tt.want != nil && !errors.Is(err, tt.want)) {
 				t.Fatalf("err = %v, want %v", err, tt.want)
 			}
@@ -119,7 +118,7 @@ func TestMarkRecordFailedSendsTheInspectedResourceVersion(t *testing.T) {
 		// the API server found a newer version between our read and our write
 		return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, "sh.helm.release.v1.web.v3", errors.New("the object has been modified"))
 	})
-	err := markRecordFailed(context.Background(), kc, "", "prod", "web", pending("42"), "x", clock)
+	_, err := markRecordFailed(context.Background(), kc, "", "prod", "web", pending("42"), "x", clock)
 	if !errors.Is(err, model.ErrConflict) {
 		t.Errorf("a rejected update must surface as a conflict: %v", err)
 	}
@@ -135,7 +134,7 @@ func TestMarkRecordFailedConfigMapDriver(t *testing.T) {
 		Data: map[string]string{"release": string(releaseDoc(t, "pending-upgrade"))},
 	}
 	kc := fake.NewSimpleClientset(cm)
-	if err := markRecordFailed(context.Background(), kc, "configmap", "prod", "web", pending("7"), "x", clock); err != nil {
+	if _, err := markRecordFailed(context.Background(), kc, "configmap", "prod", "web", pending("7"), "x", clock); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := kc.CoreV1().ConfigMaps("prod").Get(context.Background(), cm.Name, metav1.GetOptions{})
@@ -155,14 +154,6 @@ func TestPendingReleasesAndUndecodableRecords(t *testing.T) {
 		t.Fatalf("keys = %v, err = %v", keys, err)
 	}
 
-	recs, _ := listRecords(ctx, kc, "", "prod", "owner=helm,name=web")
-	if err := checkDecoded(recs, map[int]bool{3: true}); err != nil {
-		t.Errorf("all records decoded: %v", err)
-	}
-	err = checkDecoded(recs, map[int]bool{})
-	if err == nil || !strings.Contains(err.Error(), "sh.helm.release.v1.web.v3") {
-		t.Errorf("a record the SDK skipped must be named: %v", err)
-	}
 }
 
 func TestListRecordsSurfacesAccessErrors(t *testing.T) {

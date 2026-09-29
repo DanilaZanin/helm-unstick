@@ -44,9 +44,14 @@ type Signal struct {
 	Object string // for example Deployment/web
 	Detail string
 	// Bounded marks a signal that only says "Helm --wait may still be waiting on this
-	// object". Helm gives up after its --timeout, so the signal stops counting once the
-	// pending record is older than that timeout plus a grace period.
+	// object". Helm applies --timeout to the pre-hooks, the wait and the post-hooks one
+	// after another, so the signal stops counting once the pending record is older than
+	// WaitWindow(--helm-timeout).
 	Bounded bool
+	// Permanent marks real work in progress: an active hook Job or a running hook Pod.
+	// Helm's timeout does not end it (the workload keeps running after helm is killed), so it
+	// never expires. The user waits for it or deletes it.
+	Permanent bool
 }
 
 func (s Signal) String() string { return s.Object + ": " + s.Detail }
@@ -68,9 +73,14 @@ type Input struct {
 	Evidence    Evidence
 }
 
-// HelmGrace is added to the Helm timeout before a not-ready object stops counting: it covers
-// clock skew and the moment Helm needs to notice the timeout and write its final record.
+// HelmGrace is added to the Helm wait window before a not-ready object stops counting: it
+// covers clock skew and the moment Helm needs to notice the timeout and write its final record.
 const HelmGrace = time.Minute
+
+// WaitWindow is how long a live helm can legitimately keep a release pending without any
+// object changing: --timeout applies to the pre-hooks, to the wait and to the post-hooks
+// separately (pkg/action/upgrade.go), so the worst case is three timeouts, plus the grace.
+func WaitWindow(helmTimeout time.Duration) time.Duration { return 3*helmTimeout + HelmGrace }
 
 // Result is the verdict plus the human-readable reasons behind it.
 type Result struct {
@@ -96,16 +106,20 @@ func Decide(in Input) Result {
 	if skewed {
 		res.Reasons = append(res.Reasons, "the pending revision is timestamped in the future (clock skew between this machine and the cluster?)")
 	}
-	waitLimit := in.HelmTimeout + HelmGrace
+	waitLimit := WaitWindow(in.HelmTimeout)
 	var expired []string
 	for _, s := range in.Evidence.Signals {
 		switch {
-		case s.Bounded && age >= waitLimit:
+		case s.Permanent:
+			running = true
+			res.Reasons = append(res.Reasons, fmt.Sprintf(
+				"%s [real work is running and no timeout ends it: wait for it to finish or delete the hook Job/Pod if it is orphaned]", s))
+		case s.Bounded && age > waitLimit:
 			expired = append(expired, s.Object)
 		case s.Bounded:
 			running = true
 			res.Reasons = append(res.Reasons, fmt.Sprintf(
-				"%s [a live helm may still be waiting: the record is younger than --helm-timeout %s plus %s grace; set --helm-timeout to the --timeout of your deploy]",
+				"%s [a live helm may still be waiting: the record is younger than 3 x --helm-timeout %s plus %s grace, the worst case of pre-hooks, wait and post-hooks; set --helm-timeout to the --timeout of your deploy]",
 				s, humanize.Duration(in.HelmTimeout), humanize.Duration(HelmGrace)))
 		default:
 			running = true
@@ -138,7 +152,7 @@ func Decide(in Input) Result {
 	}
 	if len(expired) > 0 {
 		res.Reasons = append(res.Reasons, fmt.Sprintf(
-			"%s not ready, but the record is older than the Helm timeout (%s) plus grace, so any helm that waited on them has given up",
+			"%s not ready, but the record is older than 3 x the Helm timeout (%s) plus grace, so any helm that waited on them has given up",
 			strings.Join(expired, ", "), humanize.Duration(in.HelmTimeout)))
 	} else {
 		res.Reasons = append(res.Reasons, "nothing Helm --wait would wait on (Pods, Jobs, rollouts, volumes, load balancers) is pending")

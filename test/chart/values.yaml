@@ -12,3 +12,7 @@ progressDeadline: 0
 # Adds a LoadBalancer Service. kind has no load balancer, so it never gets an ingress address
 # and helm --wait keeps waiting for it.
 loadBalancer: false
+
+# Adds a pre-install/pre-upgrade hook Job that sleeps this many seconds. helm waits for it, and
+# it keeps running when the helm client is killed. 0 adds no hook.
+hookSleep: 0

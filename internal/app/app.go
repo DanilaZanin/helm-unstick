@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -58,13 +59,16 @@ type Backend interface {
 	Inspect(ctx context.Context, s *model.Stuck, now time.Time, window time.Duration) (verdict.Evidence, error)
 	// Rollback rolls the release back to revision through the Helm SDK and returns the number
 	// of the revision it created (0 when it created none), also when it fails afterwards.
-	// A refusal because the release has a pending revision wraps model.ErrPending.
-	Rollback(ctx context.Context, namespace, release string, revision int, opts model.ActionOptions) (int, error)
+	// A refusal because the release has a pending revision wraps model.ErrPending. from is the
+	// head revision as inspected: if its storage record is no longer exactly that (same status
+	// and Version), nothing is written and the error wraps model.ErrConflict.
+	Rollback(ctx context.Context, namespace, release string, from model.Revision, revision int, opts model.ActionOptions) (int, error)
 	// MarkFailed sets one revision to failed, but only if its storage record is still the one
 	// in from (same status and Version). Otherwise it writes nothing and wraps model.ErrConflict.
-	MarkFailed(ctx context.Context, namespace, release string, from model.Revision, reason string) error
-	// Uninstall removes the release and, unless kept, its history.
-	Uninstall(ctx context.Context, namespace, release string, opts model.ActionOptions) error
+	// It returns the revision as stored afterwards (failed, with its new Version).
+	MarkFailed(ctx context.Context, namespace, release string, from model.Revision, reason string) (model.Revision, error)
+	// Uninstall removes the release together with its history. from is guarded like the one of Rollback.
+	Uninstall(ctx context.Context, namespace, release string, from model.Revision, opts model.ActionOptions) error
 }
 
 // Factory builds a Backend once the flags are known.
@@ -79,6 +83,7 @@ type Env struct {
 	Interactive bool   // stdin is a terminal
 	Tool        string // how the user invokes the tool: helm-unstick, helm unstick, kubectl unstick
 	Version     string
+	Getenv      func(string) string // os.Getenv when nil
 }
 
 // Run executes one command line and returns the process exit code.
@@ -88,6 +93,9 @@ func Run(ctx context.Context, args []string, env Env, newBackend Factory) int {
 	}
 	if env.Tool == "" {
 		env.Tool = "helm-unstick"
+	}
+	if env.Getenv == nil {
+		env.Getenv = os.Getenv
 	}
 	if len(args) == 0 {
 		fmt.Fprint(env.Stderr, usage(env.Tool))
@@ -143,8 +151,11 @@ Exit codes:
   3  fix refused: the operation may still be running, or liveness could not be verified
 
 --helm-timeout: set it to the --timeout your deploys pass to helm (default 5m, Helm's own
-default). A live helm --wait may still be waiting on a not-ready Pod, volume, load balancer
-or rollout until the record is older than that timeout plus a minute.
+default). Helm applies --timeout to the pre-hooks, the wait and the post-hooks separately,
+so a live helm --wait may still be waiting on a not-ready Pod, volume, load balancer or
+rollout until the record is older than 3 x that timeout plus a minute. A running hook Job
+or Pod blocks fix whatever the age: wait for it, or delete it if it is orphaned.
+A value smaller than the real --timeout can let fix roll back under a live helm.
 
 fix acts only on releases with verdict "stale". Run "%[1]s explain RELEASE" to see why.
 `, tool)
@@ -183,13 +194,38 @@ func bindThresholds(fs *flag.FlagSet) (older, helm *durationFlag) {
 
 // planContext builds the plan.Context that repeats the flags the user passed, so every
 // printed command acts on the same cluster, storage and thresholds.
+//
+// Under "helm unstick" Helm consumes --kube-context and --kubeconfig itself and hands them
+// over as HELM_KUBECONTEXT and KUBECONFIG, so the flags never reach this program. The printed
+// commands would then act on the default cluster, and the environment is read back.
 func planContext(env Env, fs *flag.FlagSet, g Global) plan.Context {
-	return plan.Context{
+	pc := plan.Context{
 		Tool:      env.Tool,
 		Flags:     passthrough(fs, "older-than", "helm-timeout", "kube-context", "kubeconfig", "driver"),
 		HelmFlags: passthrough(fs, "kube-context", "kubeconfig"),
 		Driver:    g.Driver,
 	}
+	if env.Getenv("HELM_PLUGIN_DIR") == "" {
+		return pc
+	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	add := func(flag string) {
+		pc.Flags = append(pc.Flags, flag)
+		pc.HelmFlags = append(pc.HelmFlags, flag)
+	}
+	if v := env.Getenv("HELM_KUBECONTEXT"); v != "" && !explicit["kube-context"] {
+		add("--kube-context " + shellQuote(v))
+	}
+	if v := env.Getenv("KUBECONFIG"); v != "" && !explicit["kubeconfig"] {
+		if strings.ContainsRune(v, os.PathListSeparator) {
+			// a list of files is not a valid --kubeconfig value, it only works as the variable
+			pc.EnvPrefix = append(pc.EnvPrefix, "KUBECONFIG="+shellQuote(v))
+		} else {
+			add("--kubeconfig " + shellQuote(v))
+		}
+	}
+	return pc
 }
 
 // durationFlag is a time.Duration flag that remembers how the user spelled it, so the

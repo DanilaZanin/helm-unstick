@@ -5,6 +5,8 @@
 # HELM_UNSTICK_DRY_RUN=1 prints the download URL and exits.
 # HELM_UNSTICK_BINARY=/path/to/helm-unstick installs that binary instead of downloading a
 # release, for installing the plugin from a local checkout (CI does this).
+# HELM_UNSTICK_BASE_URL=URL downloads archive and checksums.txt from URL instead of the GitHub
+# release (file:// works), so the download and checksum path can be tested without a release.
 set -eu
 
 repo="DanilaZanin/helm-unstick"
@@ -36,7 +38,7 @@ if [ -n "${HELM_UNSTICK_BINARY:-}" ]; then
 fi
 
 archive="helm-unstick_v${version}_${os}_${arch}.tar.gz"
-base="https://github.com/${repo}/releases/download/v${version}"
+base="${HELM_UNSTICK_BASE_URL:-https://github.com/${repo}/releases/download/v${version}}"
 
 if [ "${HELM_UNSTICK_DRY_RUN:-0}" = 1 ]; then
   echo "$base/$archive"

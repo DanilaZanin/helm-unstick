@@ -25,6 +25,10 @@ type Ref struct {
 	// live objects are the ones whose names start with it.
 	GenerateName string
 	Hook         bool // the object comes from a Helm hook manifest
+	// Labels are the labels of the rendered manifest as sorted "key=value" pairs joined by
+	// commas. A generated-name object that carries one of them with the release name as its
+	// value is known to belong to the release.
+	Labels string
 }
 
 func (r Ref) String() string {
@@ -40,7 +44,8 @@ func (r Ref) String() string {
 // Besides recent modifications it answers one question: would `helm ... --wait` still be
 // waiting on this object? The rules follow Helm 3's ReadyChecker (pkg/kube/ready.go) and,
 // where kubectl rollout status is stricter, kubectl. Being stricter is the safe direction:
-// every such signal expires with Helm's own timeout (see verdict.Signal.Bounded).
+// every such signal expires with Helm's own timeout (see verdict.Signal.Bounded), except an
+// active hook Job or running hook Pod, which is real work and never expires (Signal.Permanent).
 func Inspect(ref Ref, obj map[string]interface{}, now time.Time, window time.Duration) []verdict.Signal {
 	var out []verdict.Signal
 	if at, manager, ok := LatestModification(obj); ok && window > 0 && now.Sub(at) < window {
@@ -65,12 +70,20 @@ func Inspect(ref Ref, obj map[string]interface{}, now time.Time, window time.Dur
 		}
 	case isKind(ref, "Job", "batch"):
 		if why, busy := jobBusy(obj); busy {
-			out = append(out, jobSignal(ref, why))
+			sig := jobSignal(ref, why)
+			if active, _ := intAt(obj, "status", "active"); ref.Hook && active > 0 {
+				sig = permanent(sig)
+			}
+			out = append(out, sig)
 		}
 	case isKind(ref, "Pod", ""):
 		why, busy := podBusy(obj, ref.Hook)
 		if busy && ref.Hook {
-			out = append(out, jobSignal(ref, why))
+			sig := jobSignal(ref, why)
+			if phase, _ := stringAt(obj, "status", "phase"); phase == "Running" {
+				sig = permanent(sig)
+			}
+			out = append(out, sig)
 		} else if busy {
 			out = append(out, notReady(ref, why))
 		}
@@ -82,7 +95,7 @@ func Inspect(ref Ref, obj map[string]interface{}, now time.Time, window time.Dur
 		if why, busy := serviceBusy(obj); busy {
 			out = append(out, notReady(ref, why))
 		}
-	case isKind(ref, "ReplicaSet", "apps", "extensions"):
+	case isKind(ref, "ReplicaSet", "apps", "extensions"), isKind(ref, "ReplicationController", ""):
 		if why, busy := replicaSetBusy(obj); busy {
 			out = append(out, notReady(ref, why))
 		}
@@ -112,6 +125,13 @@ func jobSignal(ref Ref, why string) verdict.Signal {
 		what = "hook has not finished"
 	}
 	return verdict.Signal{Kind: verdict.SignalJobRunning, Object: ref.String(), Detail: what + ": " + why, Bounded: true}
+}
+
+// permanent turns a hook signal into real work that no timeout ends: the workload runs on
+// after the helm that started it is gone.
+func permanent(s verdict.Signal) verdict.Signal {
+	s.Bounded, s.Permanent = false, true
+	return s
 }
 
 func orUnset(s string) string {

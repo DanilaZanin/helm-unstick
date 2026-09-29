@@ -87,22 +87,26 @@ func (c *Client) Inspect(ctx context.Context, s *model.Stuck, now time.Time, win
 		return ev, err
 	}
 	since := s.Pending.Updated.Add(-generatedSlack)
+	who := owner{release: s.Release, namespace: s.Namespace}
 
 	failures := map[string]bool{}
 	for _, ref := range refs {
 		lookup, cancel := context.WithTimeout(ctx, lookupTimeout)
-		objs, err := kube.fetch(lookup, ref, since)
+		objs, unproven, err := kube.fetch(lookup, ref, since, who)
 		cancel()
+		for _, o := range objs {
+			ev.Checked++
+			found := ref
+			found.Name = o.GetName()
+			ev.Signals = append(ev.Signals, liveness.Inspect(found, o.Object, now, window)...)
+		}
+		if len(unproven) > 0 {
+			failures[fmt.Sprintf("%s: %s match the generated name but nothing proves they belong to release %q, so they are not counted (no %s/%s annotations, no app.kubernetes.io/instance label)",
+				ref, strings.Join(unproven, ", "), s.Release, annotationReleaseName, annotationReleaseNamespace)] = true
+		}
 		switch {
-		case err == nil:
-			for _, o := range objs {
-				ev.Checked++
-				found := ref
-				found.Name = o.GetName()
-				ev.Signals = append(ev.Signals, liveness.Inspect(found, o.Object, now, window)...)
-			}
-		case errors.Is(err, errGone):
-			// Nothing to look at: the operation may not have reached this object.
+		case err == nil, errors.Is(err, errGone):
+			// errGone: nothing to look at, the operation may not have reached this object.
 		default:
 			failures[fmt.Sprintf("%s: %v", ref, err)] = true
 		}
@@ -143,12 +147,47 @@ func (k *kubeAccess) mapping(ref liveness.Ref) (*meta.RESTMapping, error) {
 	return nil, fmt.Errorf("the cluster does not serve %s %s, so the object cannot be checked (CRD not installed, or an API version that was removed)", ref.APIVersion, ref.Kind)
 }
 
-// fetch returns the live objects behind a ref: one for a named object, every object created
-// since `since` whose name starts with the generateName prefix otherwise.
-func (k *kubeAccess) fetch(ctx context.Context, ref liveness.Ref, since time.Time) ([]*unstructured.Unstructured, error) {
+// owner identifies the release that objects must belong to.
+type owner struct{ release, namespace string }
+
+const (
+	annotationReleaseName      = "meta.helm.sh/release-name"
+	annotationReleaseNamespace = "meta.helm.sh/release-namespace"
+	labelInstance              = "app.kubernetes.io/instance"
+)
+
+// belongs decides whether a live object of a generated name is this release's. Helm stamps
+// the release annotations on the objects of the manifest; hook objects carry the labels the
+// hook manifest rendered, so a rendered label whose value is the release name proves it too,
+// as does the standard instance label. Another release's annotations or instance label prove
+// the opposite (foreign). Anything else is unproven.
+func belongs(o *unstructured.Unstructured, ref liveness.Ref, who owner) (owned, foreign bool) {
+	if name, ok := o.GetAnnotations()[annotationReleaseName]; ok {
+		if name == who.release && o.GetAnnotations()[annotationReleaseNamespace] == who.namespace {
+			return true, false
+		}
+		return false, true
+	}
+	labels := o.GetLabels()
+	if v, ok := labels[labelInstance]; ok {
+		return v == who.release, v != who.release
+	}
+	for _, pair := range strings.Split(ref.Labels, ",") {
+		if k, v, ok := strings.Cut(pair, "="); ok && v == who.release && labels[k] == v {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// fetch returns the live objects behind a ref: one for a named object. For a generateName ref
+// it returns the objects created since `since` whose name starts with the prefix and that
+// belong to the release; `unproven` names the ones that match but carry no proof of either
+// ownership, which the caller must report as an incomplete check rather than guess about.
+func (k *kubeAccess) fetch(ctx context.Context, ref liveness.Ref, since time.Time, who owner) (objs []*unstructured.Unstructured, unproven []string, err error) {
 	mapping, err := k.mapping(ref)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var ri dynamic.ResourceInterface
 	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
@@ -159,23 +198,29 @@ func (k *kubeAccess) fetch(ctx context.Context, ref liveness.Ref, since time.Tim
 	if ref.Name == "" {
 		list, err := ri.List(ctx, metav1.ListOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("listing objects with generated names: %w", err)
+			return nil, nil, fmt.Errorf("listing objects with generated names: %w", err)
 		}
-		var out []*unstructured.Unstructured
 		for i := range list.Items {
 			o := &list.Items[i]
-			if strings.HasPrefix(o.GetName(), ref.GenerateName) && !o.GetCreationTimestamp().Time.Before(since) {
-				out = append(out, o)
+			if !strings.HasPrefix(o.GetName(), ref.GenerateName) || o.GetCreationTimestamp().Time.Before(since) {
+				continue
+			}
+			switch owned, foreign := belongs(o, ref, who); {
+			case owned:
+				objs = append(objs, o)
+			case !foreign:
+				unproven = append(unproven, o.GetName())
 			}
 		}
-		return out, nil
+		sort.Strings(unproven)
+		return objs, unproven, nil
 	}
 	obj, err := ri.Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, errGone
+			return nil, nil, errGone
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return []*unstructured.Unstructured{obj}, nil
+	return []*unstructured.Unstructured{obj}, nil, nil
 }

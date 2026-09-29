@@ -70,6 +70,23 @@ items:
 	}
 }
 
+func TestParseManifestKeepsTheRenderedLabels(t *testing.T) {
+	got, err := parseManifest(`apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: web-migrate-
+  labels:
+    release: web
+    app: migrate
+`, "prod", true)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("%+v, %v", got, err)
+	}
+	if got[0].GenerateName != "web-migrate-" || got[0].Labels != "app=migrate,release=web" {
+		t.Errorf("ref = %+v: the labels prove which release a generated-name object belongs to", got[0])
+	}
+}
+
 func TestParseManifestEmptyAndInvalid(t *testing.T) {
 	if got, err := parseManifest("", "prod", false); err != nil || len(got) != 0 {
 		t.Errorf("empty manifest: %+v, %v", got, err)

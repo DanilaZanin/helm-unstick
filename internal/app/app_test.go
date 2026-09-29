@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"sort"
 	"strings"
@@ -43,6 +44,10 @@ type fakeBackend struct {
 	beforeMarkFailed func()      // runs at the start of MarkFailed, to change the release underneath
 	afterRollback    func(n int) // runs after a successful Rollback created revision n
 	onInspect        func(call int)
+	beforeRollback   func() // runs at the start of Rollback and Uninstall, to change the release underneath
+	duringRollback   func() // runs inside a successful Rollback, like a Ctrl-C while the SDK writes
+	rollbackTries    int    // Rollback and Uninstall calls, also the ones the guard rejected
+	rollbackFrom     []model.Revision
 }
 
 func newFake(revs ...model.Revision) *fakeBackend {
@@ -111,7 +116,25 @@ func (f *fakeBackend) latest(ns, name string) *model.Revision {
 	return &revs[best]
 }
 
-func (f *fakeBackend) Rollback(_ context.Context, ns, name string, revision int, _ model.ActionOptions) (int, error) {
+// guard is the conditional write of the real backend: the record must still be the one inspected.
+func (f *fakeBackend) guard(ns, name string, from model.Revision) error {
+	f.rollbackTries++
+	f.rollbackFrom = append(f.rollbackFrom, from)
+	if f.beforeRollback != nil {
+		f.beforeRollback()
+	}
+	for _, r := range f.releases[key{ns, name}] {
+		if r.Number == from.Number && (r.Status != from.Status || r.Version != from.Version) {
+			return fmt.Errorf("revision %d is %s (version %q) now: %w", from.Number, r.Status, r.Version, model.ErrConflict)
+		}
+	}
+	return nil
+}
+
+func (f *fakeBackend) Rollback(_ context.Context, ns, name string, from model.Revision, revision int, _ model.ActionOptions) (int, error) {
+	if err := f.guard(ns, name, from); err != nil {
+		return 0, err
+	}
 	f.calls = append(f.calls, fmt.Sprintf("rollback %d", revision))
 	last := f.latest(ns, name)
 	if f.failRollback || (f.refusePending && last.Status.IsPending()) {
@@ -119,6 +142,9 @@ func (f *fakeBackend) Rollback(_ context.Context, ns, name string, revision int,
 			return 0, f.rollbackErr
 		}
 		return 0, errBusy
+	}
+	if f.duringRollback != nil {
+		f.duringRollback()
 	}
 	if !f.leavePending && last.Status.IsPending() {
 		last.Status = model.StatusSuperseded
@@ -139,7 +165,7 @@ func (f *fakeBackend) Rollback(_ context.Context, ns, name string, revision int,
 	return created, nil
 }
 
-func (f *fakeBackend) MarkFailed(_ context.Context, ns, name string, from model.Revision, _ string) error {
+func (f *fakeBackend) MarkFailed(_ context.Context, ns, name string, from model.Revision, _ string) (model.Revision, error) {
 	f.calls = append(f.calls, fmt.Sprintf("mark-failed %d", from.Number))
 	if f.beforeMarkFailed != nil {
 		f.beforeMarkFailed()
@@ -148,16 +174,22 @@ func (f *fakeBackend) MarkFailed(_ context.Context, ns, name string, from model.
 	for i := range revs {
 		if revs[i].Number == from.Number {
 			if revs[i].Status != from.Status || revs[i].Version != from.Version {
-				return fmt.Errorf("revision %d is %s now: %w", from.Number, revs[i].Status, model.ErrConflict)
+				return model.Revision{}, fmt.Errorf("revision %d is %s now: %w", from.Number, revs[i].Status, model.ErrConflict)
 			}
 			revs[i].Status = model.StatusFailed
-			return nil
+			if revs[i].Version != "" {
+				revs[i].Version += "+" // a write bumps the resourceVersion
+			}
+			return revs[i], nil
 		}
 	}
-	return errors.New("no such revision")
+	return model.Revision{}, errors.New("no such revision")
 }
 
-func (f *fakeBackend) Uninstall(_ context.Context, ns, name string, _ model.ActionOptions) error {
+func (f *fakeBackend) Uninstall(_ context.Context, ns, name string, from model.Revision, _ model.ActionOptions) error {
+	if err := f.guard(ns, name, from); err != nil {
+		return err
+	}
 	f.calls = append(f.calls, "uninstall")
 	delete(f.releases, key{ns, name})
 	return nil
@@ -166,12 +198,19 @@ func (f *fakeBackend) Uninstall(_ context.Context, ns, name string, _ model.Acti
 // run executes a command line against the fake and returns exit code and output.
 func run(t *testing.T, f *fakeBackend, stdin string, interactive bool, args ...string) (int, string, string) {
 	t.Helper()
+	return runIn(t, context.Background(), f, strings.NewReader(stdin), interactive, nil, "helm-unstick", args...)
+}
+
+// runIn is run with a context, a reader for stdin, environment variables and the tool name.
+func runIn(t *testing.T, ctx context.Context, f *fakeBackend, stdin io.Reader, interactive bool, environ map[string]string, tool string, args ...string) (int, string, string) {
+	t.Helper()
 	var stdout, stderr bytes.Buffer
 	env := Env{
-		Stdin: strings.NewReader(stdin), Stdout: &stdout, Stderr: &stderr,
-		Now: func() time.Time { return t0 }, Interactive: interactive, Tool: "helm-unstick", Version: "test",
+		Stdin: stdin, Stdout: &stdout, Stderr: &stderr,
+		Now: func() time.Time { return t0 }, Interactive: interactive, Tool: tool, Version: "test",
+		Getenv: func(k string) string { return environ[k] },
 	}
-	code := Run(context.Background(), args, env, func(g Global) (Backend, error) { return f, nil })
+	code := Run(ctx, args, env, func(g Global) (Backend, error) { return f, nil })
 	return code, stdout.String(), stderr.String()
 }
 
@@ -421,8 +460,8 @@ func TestFixAutoDoesNotRetryWhenStateChanged(t *testing.T) {
 // changingBackend appends a new revision as a side effect of the first failed rollback.
 type changingBackend struct{ *fakeBackend }
 
-func (c *changingBackend) Rollback(ctx context.Context, ns, name string, revision int, o model.ActionOptions) (int, error) {
-	n, err := c.fakeBackend.Rollback(ctx, ns, name, revision, o)
+func (c *changingBackend) Rollback(ctx context.Context, ns, name string, from model.Revision, revision int, o model.ActionOptions) (int, error) {
+	n, err := c.fakeBackend.Rollback(ctx, ns, name, from, revision, o)
 	k := key{ns, name}
 	c.releases[k] = append(c.releases[k], model.Revision{Number: 4, Status: model.StatusPendingUpgrade, Updated: t0})
 	return n, err
@@ -725,8 +764,8 @@ func TestShellQuote(t *testing.T) {
 var waiting = verdict.Signal{Kind: verdict.SignalNotReady, Object: "Service/lb", Detail: "helm --wait may still be waiting: load balancer has no ingress address yet", Bounded: true}
 
 func TestHelmTimeoutDecidesWhenAWaitingReleaseIsStale(t *testing.T) {
-	// record age 7m, --older-than 0s: only Helm's own timeout can still protect the release
-	f := newFake(rev(1, model.StatusDeployed, 48*time.Hour), rev(2, model.StatusPendingUpgrade, 7*time.Minute))
+	// record age 17m, --older-than 0s: only Helm's own timeout can still protect the release
+	f := newFake(rev(1, model.StatusDeployed, 48*time.Hour), rev(2, model.StatusPendingUpgrade, 17*time.Minute))
 	f.evidence = verdict.Evidence{Signals: []verdict.Signal{waiting}}
 
 	code, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s", "--helm-timeout", "30m")
@@ -737,7 +776,7 @@ func TestHelmTimeoutDecidesWhenAWaitingReleaseIsStale(t *testing.T) {
 
 	code, out, _ = run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s")
 	if code != ExitOK {
-		t.Fatalf("with the default 5m timeout plus grace the record is past helm's wait: exit = %d\n%s", code, out)
+		t.Fatalf("with the default 5m timeout the record is past 3 x 5m plus grace, the worst case of helm's phases: exit = %d\n%s", code, out)
 	}
 	assertCalls(t, f, "rollback 1")
 }
@@ -915,5 +954,156 @@ func TestOverwrittenRefusalAdvice(t *testing.T) {
 	_, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--older-than", "0s", "--helm-timeout", "1h")
 	if strings.Contains(out, "raise --older-than") {
 		t.Errorf("wrong advice in the refusal:\n%s", out)
+	}
+}
+
+func TestRollbackIsConditionalOnTheInspectedRecord(t *testing.T) {
+	// a live helm rewrites the pending record after the checks and before the SDK call
+	f := stuckUpgrade()
+	f.releases[key{"prod", "web"}][2].Version = "100"
+	f.beforeRollback = func() { f.releases[key{"prod", "web"}][2].Version = "101" }
+	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitError || !strings.Contains(errOut, "changed since it was inspected") {
+		t.Errorf("exit = %d, stderr = %q\n%s", code, errOut, out)
+	}
+	assertCalls(t, f)
+	if statusOf(f, 3) != model.StatusPendingUpgrade {
+		t.Errorf("a record that moved was acted on: %s", statusOf(f, 3))
+	}
+}
+
+func TestUninstallIsConditionalOnTheInspectedRecord(t *testing.T) {
+	f := newFake(rev(1, model.StatusPendingInstall, 3*time.Hour))
+	f.releases[key{"prod", "web"}][0].Version = "7"
+	f.beforeRollback = func() { f.releases[key{"prod", "web"}][0].Version = "8" }
+	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--first-install=uninstall")
+	if code != ExitError || !strings.Contains(errOut, "changed since it was inspected") {
+		t.Errorf("exit = %d, stderr = %q", code, errOut)
+	}
+	assertCalls(t, f)
+	if _, ok := f.releases[key{"prod", "web"}]; !ok {
+		t.Error("the release was uninstalled although its record moved")
+	}
+}
+
+func TestFixChecksTheRecordAgainAfterTheSecondInspection(t *testing.T) {
+	f := stuckUpgrade()
+	f.releases[key{"prod", "web"}][2].Version = "100"
+	f.onInspect = func(call int) {
+		if call == 2 { // helm writes to the record while the recheck is looking at the cluster
+			f.releases[key{"prod", "web"}][2].Version = "101"
+		}
+	}
+	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitError || !strings.Contains(errOut, "changed while helm-unstick was checking") {
+		t.Errorf("exit = %d, stderr = %q", code, errOut)
+	}
+	if f.rollbackTries != 0 {
+		t.Errorf("the SDK guard was reached %d times: the change must be caught before any write is attempted", f.rollbackTries)
+	}
+}
+
+func TestRollbackAfterMarkFailedIsGuardedWithTheNewRecord(t *testing.T) {
+	f := stuckUpgrade()
+	f.refusePending = true
+	f.releases[key{"prod", "web"}][2].Version = "100"
+	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitOK {
+		t.Fatalf("exit = %d\n%s\n%s", code, out, errOut)
+	}
+	if len(f.rollbackFrom) != 2 {
+		t.Fatalf("rollback guards = %+v", f.rollbackFrom)
+	}
+	first, second := f.rollbackFrom[0], f.rollbackFrom[1]
+	if first.Status != model.StatusPendingUpgrade || first.Version != "100" {
+		t.Errorf("first rollback guard = %+v, want the inspected pending record", first)
+	}
+	if second.Status != model.StatusFailed || second.Version != "100+" {
+		t.Errorf("second rollback guard = %+v, want the record mark-failed just wrote", second)
+	}
+}
+
+func TestInterruptDuringRollbackDoesNotAbortTheWrite(t *testing.T) {
+	f := stuckUpgrade()
+	f.leavePending = true // the rollback leaves revision 3 pending: cleanup would be the next write
+	ctx, cancel := context.WithCancel(context.Background())
+	f.duringRollback = cancel // the first Ctrl-C arrives while the SDK is writing
+	code, out, errOut := runIn(t, ctx, f, strings.NewReader(""), false, nil, "helm-unstick", "fix", "web", "-n", "prod", "--yes")
+	if code != ExitError {
+		t.Fatalf("exit = %d, want an error exit so scripts notice the interruption\n%s", code, out)
+	}
+	if !strings.Contains(errOut, "rollback completed") || !strings.Contains(errOut, "revision 4") {
+		t.Errorf("the report must say the write finished and which revision it made: %q", errOut)
+	}
+	assertCalls(t, f, "rollback 2") // finished, and nothing further started
+	if statusOf(f, 4) != model.StatusDeployed {
+		t.Errorf("rev4 = %s", statusOf(f, 4))
+	}
+}
+
+func TestConfirmationPromptIsInterruptible(t *testing.T) {
+	f := stuckUpgrade()
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		code     int
+		out, err string
+	}
+	done := make(chan result, 1)
+	go func() {
+		code, out, errOut := runIn(t, ctx, f, pr, true, nil, "helm-unstick", "fix", "web", "-n", "prod")
+		done <- result{code, out, errOut}
+	}()
+	time.Sleep(100 * time.Millisecond) // the prompt is waiting on stdin
+	cancel()
+	select {
+	case r := <-done:
+		if r.code != ExitError || !strings.Contains(r.err, "interrupted") {
+			t.Errorf("exit = %d, stderr = %q", r.code, r.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ctrl-C did not end the confirmation prompt")
+	}
+	assertCalls(t, f)
+}
+
+func TestPluginModeCommandsKeepWhatHelmConsumed(t *testing.T) {
+	// under "helm unstick" Helm swallows --kube-context and --kubeconfig and hands them over as env
+	plugin := map[string]string{"HELM_PLUGIN_DIR": "/p", "HELM_KUBECONTEXT": "staging", "KUBECONFIG": "/tmp/kc"}
+	_, out, _ := runIn(t, context.Background(), stuckUpgrade(), strings.NewReader(""), false, plugin, "helm unstick", "explain", "web", "-n", "prod")
+	for _, want := range []string{
+		"helm rollback web 2 -n prod --kube-context staging --kubeconfig /tmp/kc",
+		"helm unstick fix web -n prod --kube-context staging --kubeconfig /tmp/kc",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a pasted command would act on another cluster; want %q in:\n%s", want, out)
+		}
+	}
+
+	// a KUBECONFIG list cannot be passed as --kubeconfig, so it travels as the variable
+	plugin["KUBECONFIG"] = "/a/kc:/b/kc"
+	_, out, _ = runIn(t, context.Background(), stuckUpgrade(), strings.NewReader(""), false, plugin, "helm unstick", "explain", "web", "-n", "prod")
+	if !strings.Contains(out, "KUBECONFIG=/a/kc:/b/kc helm rollback web 2 -n prod --kube-context staging") {
+		t.Errorf("a kubeconfig list must be kept as the variable:\n%s", out)
+	}
+
+	// outside plugin mode the environment is the user's own shell: nothing is added
+	_, out, _ = runIn(t, context.Background(), stuckUpgrade(), strings.NewReader(""), false,
+		map[string]string{"HELM_KUBECONTEXT": "staging", "KUBECONFIG": "/tmp/kc"}, "helm-unstick", "explain", "web", "-n", "prod")
+	if strings.Contains(out, "--kube-context") || strings.Contains(out, "--kubeconfig") {
+		t.Errorf("standalone mode must not invent flags:\n%s", out)
+	}
+}
+
+func TestExplicitDriverOverridesTheInheritedOne(t *testing.T) {
+	inherited := map[string]string{"HELM_DRIVER": "configmap"}
+	_, out, _ := runIn(t, context.Background(), stuckUpgrade(), strings.NewReader(""), false, inherited, "helm-unstick", "explain", "web", "-n", "prod", "--driver", "secret")
+	if !strings.Contains(out, "HELM_DRIVER=secret helm rollback web 2 -n prod") {
+		t.Errorf("--driver secret must beat an inherited HELM_DRIVER=configmap in the printed helm command:\n%s", out)
+	}
+	_, out, _ = runIn(t, context.Background(), stuckUpgrade(), strings.NewReader(""), false, inherited, "helm-unstick", "explain", "web", "-n", "prod")
+	if strings.Contains(out, "HELM_DRIVER=") {
+		t.Errorf("without --driver the inherited variable already applies:\n%s", out)
 	}
 }

@@ -25,9 +25,43 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: plugin.yaml carries the version of the tag
+        run: |
+          version=$(sed -n 's/^version:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' plugin.yaml | head -n 1)
+          test "$version" = "${GITHUB_REF_NAME#v}" || { echo "plugin.yaml says $version, the tag is $GITHUB_REF_NAME: the install hook would download the wrong archive" >&2; exit 1; }
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # The published release, installed the way the README says: helm fetches the tag from Git and
+  # the install hook downloads the archive and checks it against checksums.txt.
+  plugin-smoke:
+    name: install the published plugin (Helm ${{ matrix.helm }})
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        helm: ["3", "4"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm ${{ matrix.helm }}
+        id: helm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "bin=$(test/install-helm.sh '${{ matrix.helm }}' "$RUNNER_TEMP/helm${{ matrix.helm }}")" >> "$GITHUB_OUTPUT"
+      - name: helm plugin install from the tag
+        env:
+          HELM: ${{ steps.helm.outputs.bin }}
+          HELM_MAJOR: ${{ matrix.helm }}
+        run: |
+          # Helm 4 verifies plugin signatures and a Git source has none: the README says so too
+          verify=()
+          if [ "$HELM_MAJOR" != 3 ]; then verify=(--verify=false); fi
+          "$HELM" plugin install "https://github.com/${GITHUB_REPOSITORY}" --version "$GITHUB_REF_NAME" "${verify[@]}"
+          "$HELM" unstick version | tee version.txt
+          grep -F "${GITHUB_REF_NAME#v}" version.txt

@@ -30,8 +30,9 @@ func main() { os.Exit(run()) }
 func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// After the first Ctrl-C the commands stop before their next write; a second one must be
-	// able to kill the process, so the signal handler is dropped once the context is done.
+	// After the first Ctrl-C the commands stop before their next write, and a write that is
+	// already running (a Helm SDK call cannot be canceled) is left to finish. A second Ctrl-C
+	// must be able to kill the process, so the signal handler is dropped once the context is done.
 	context.AfterFunc(ctx, stop)
 	env := app.Env{
 		Stdin:       os.Stdin,

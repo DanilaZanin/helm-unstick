@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"helm.sh/helm/v3/pkg/release"
@@ -87,5 +88,18 @@ func appendRefs(refs []liveness.Ref, doc map[string]interface{}, defaultNamespac
 	if name != "" {
 		generateName = ""
 	}
-	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, GenerateName: generateName, Hook: hook})
+	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, GenerateName: generateName, Hook: hook, Labels: joinLabels(metadata["labels"])})
+}
+
+// joinLabels spells the labels of a manifest document as sorted key=value pairs.
+func joinLabels(v interface{}) string {
+	m, _ := v.(map[string]interface{})
+	pairs := make([]string, 0, len(m))
+	for k, val := range m {
+		if s, ok := val.(string); ok {
+			pairs = append(pairs, k+"="+s)
+		}
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
 }
