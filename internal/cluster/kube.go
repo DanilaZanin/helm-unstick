@@ -156,28 +156,45 @@ const (
 	labelInstance              = "app.kubernetes.io/instance"
 )
 
-// belongs decides whether a live object of a generated name is this release's. Helm stamps
-// the release annotations on the objects of the manifest; hook objects carry the labels the
-// hook manifest rendered, so a rendered label whose value is the release name proves it too,
-// as does the standard instance label. Another release's annotations or instance label prove
-// the opposite (foreign). Anything else is unproven.
+// belongs decides whether a live object of a generated name is this release's. Only Helm's
+// own release annotations naming another release (or namespace) prove it foreign: the
+// app.kubernetes.io/instance label is a recommendation, charts set it to anything. Otherwise
+// the object is ours when a rendered label carries the release name, or when its helm.sh/hook
+// annotation matches the manifest's hook (the prefix and creation time were checked by the
+// caller). Anything else is unproven.
 func belongs(o *unstructured.Unstructured, ref liveness.Ref, who owner) (owned, foreign bool) {
-	if name, ok := o.GetAnnotations()[annotationReleaseName]; ok {
-		if name == who.release && o.GetAnnotations()[annotationReleaseNamespace] == who.namespace {
+	ann := o.GetAnnotations()
+	if name, ok := ann[annotationReleaseName]; ok {
+		if name == who.release && ann[annotationReleaseNamespace] == who.namespace {
 			return true, false
 		}
 		return false, true
 	}
 	labels := o.GetLabels()
-	if v, ok := labels[labelInstance]; ok {
-		return v == who.release, v != who.release
+	if labels[labelInstance] == who.release {
+		return true, false
 	}
 	for _, pair := range strings.Split(ref.Labels, ",") {
 		if k, v, ok := strings.Cut(pair, "="); ok && v == who.release && labels[k] == v {
 			return true, false
 		}
 	}
+	if ref.HookKinds != "" && normalizeHooks(ann[annotationHook]) == ref.HookKinds {
+		return true, false
+	}
 	return false, false
+}
+
+const annotationHook = "helm.sh/hook"
+
+// normalizeHooks spells a helm.sh/hook value as sorted, trimmed, comma-joined events.
+func normalizeHooks(v string) string {
+	parts := strings.Split(v, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 // fetch returns the live objects behind a ref: one for a named object. For a generateName ref

@@ -29,6 +29,9 @@ type Ref struct {
 	// commas. A generated-name object that carries one of them with the release name as its
 	// value is known to belong to the release.
 	Labels string
+	// HookKinds is the normalized helm.sh/hook annotation of the rendered manifest (sorted
+	// events joined by commas); a live object carrying the same value is the hook's.
+	HookKinds string
 }
 
 func (r Ref) String() string {
@@ -45,7 +48,7 @@ func (r Ref) String() string {
 // waiting on this object? The rules follow Helm 3's ReadyChecker (pkg/kube/ready.go) and,
 // where kubectl rollout status is stricter, kubectl. Being stricter is the safe direction:
 // every such signal expires with Helm's own timeout (see verdict.Signal.Bounded), except an
-// active hook Job or running hook Pod, which is real work and never expires (Signal.Permanent).
+// active Job (hook or not) or running hook Pod, which is real work and never expires (Signal.Permanent).
 func Inspect(ref Ref, obj map[string]interface{}, now time.Time, window time.Duration) []verdict.Signal {
 	var out []verdict.Signal
 	if at, manager, ok := LatestModification(obj); ok && window > 0 && now.Sub(at) < window {
@@ -71,7 +74,7 @@ func Inspect(ref Ref, obj map[string]interface{}, now time.Time, window time.Dur
 	case isKind(ref, "Job", "batch"):
 		if why, busy := jobBusy(obj); busy {
 			sig := jobSignal(ref, why)
-			if active, _ := intAt(obj, "status", "active"); ref.Hook && active > 0 {
+			if active, _ := intAt(obj, "status", "active"); active > 0 {
 				sig = permanent(sig)
 			}
 			out = append(out, sig)

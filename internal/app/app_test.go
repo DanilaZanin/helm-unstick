@@ -381,31 +381,15 @@ func TestExplainNotStuckAndMissing(t *testing.T) {
 	}
 }
 
-func TestFixRollbackDirectWorks(t *testing.T) {
+func TestFixDefaultStrategyClaimsFirst(t *testing.T) {
 	f := stuckUpgrade()
 	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
 	if code != ExitOK {
 		t.Fatalf("exit = %d\n%s\n%s", code, out, errOut)
 	}
-	assertCalls(t, f, "rollback 2")
-	if !strings.Contains(out, "Rollback path: direct") || !strings.Contains(out, "deployed as revision 4") {
+	assertCalls(t, f, "mark-failed 3", "rollback 2")
+	if !strings.Contains(out, "Rollback path: claim-first") || !strings.Contains(out, "deployed as revision 4") {
 		t.Errorf("unexpected output:\n%s", out)
-	}
-}
-
-func TestFixAutoFallsBackToMarkFailed(t *testing.T) {
-	f := stuckUpgrade()
-	f.refusePending = true
-	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
-	if code != ExitOK {
-		t.Fatalf("exit = %d\n%s\n%s", code, out, errOut)
-	}
-	assertCalls(t, f, "rollback 2", "mark-failed 3", "rollback 2")
-	if !strings.Contains(out, "mark-failed-first worked") {
-		t.Errorf("the output must say which path worked:\n%s", out)
-	}
-	if statusOf(f, 3) != model.StatusFailed || statusOf(f, 4) != model.StatusDeployed {
-		t.Errorf("final statuses: rev3 = %s, rev4 = %s", statusOf(f, 3), statusOf(f, 4))
 	}
 }
 
@@ -419,52 +403,28 @@ func TestFixDirectStrategyDoesNotFallBack(t *testing.T) {
 	assertCalls(t, f, "rollback 2")
 }
 
-func TestFixMarkFailedStrategyMarksFirst(t *testing.T) {
+func TestFixClaimThenRollbackFailureKeepsTheRecordFailedAndSaysSo(t *testing.T) {
 	f := stuckUpgrade()
-	f.refusePending = true
-	code, out, _ := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--strategy=mark-failed")
-	if code != ExitOK {
-		t.Fatalf("exit = %d\n%s", code, out)
+	f.failRollback = true
+	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	if code != ExitError || !strings.Contains(errOut, "stays failed") || !strings.Contains(errOut, "helm rollback web 2 -n prod") {
+		t.Errorf("exit = %d, stderr = %q", code, errOut)
 	}
 	assertCalls(t, f, "mark-failed 3", "rollback 2")
 }
 
-func TestFixAutoDoesNotMarkFailedWhenRollbackFailsForGood(t *testing.T) {
-	// A rollback that fails and still fails after mark-failed: two attempts, then an error.
+func TestFixClaimLosesToAConcurrentWriter(t *testing.T) {
+	// a live helm finishes between the recheck and our claim: the claim must not overwrite it
 	f := stuckUpgrade()
-	f.failRollback = true
+	f.beforeMarkFailed = func() { f.releases[key{"prod", "web"}][2].Version = "999" }
 	code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
-	if code != ExitError || !strings.Contains(errOut, "failed again") {
+	if code != ExitError || !strings.Contains(errOut, "marking revision 3 as failed") {
 		t.Errorf("exit = %d, stderr = %q", code, errOut)
 	}
-	assertCalls(t, f, "rollback 2", "mark-failed 3", "rollback 2")
-}
-
-func TestFixAutoDoesNotRetryWhenStateChanged(t *testing.T) {
-	f := stuckUpgrade()
-	f.refusePending = true
-	fb := &changingBackend{fakeBackend: f}
-	var stdout, stderr bytes.Buffer
-	env := Env{Stdin: strings.NewReader(""), Stdout: &stdout, Stderr: &stderr, Now: func() time.Time { return t0 }, Tool: "helm-unstick"}
-	code := Run(context.Background(), []string{"fix", "web", "-n", "prod", "--yes"}, env, func(Global) (Backend, error) { return fb, nil })
-	if code != ExitError || !strings.Contains(stderr.String(), "was not retried") {
-		t.Errorf("exit = %d, stderr = %q", code, stderr.String())
+	assertCalls(t, f, "mark-failed 3")
+	if statusOf(f, 3) != model.StatusPendingUpgrade {
+		t.Errorf("rev3 = %s: the claim overwrote a record that moved", statusOf(f, 3))
 	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "mark-failed") {
-			t.Errorf("must not mark failed after the state changed: %v", f.calls)
-		}
-	}
-}
-
-// changingBackend appends a new revision as a side effect of the first failed rollback.
-type changingBackend struct{ *fakeBackend }
-
-func (c *changingBackend) Rollback(ctx context.Context, ns, name string, from model.Revision, revision int, o model.ActionOptions) (int, error) {
-	n, err := c.fakeBackend.Rollback(ctx, ns, name, from, revision, o)
-	k := key{ns, name}
-	c.releases[k] = append(c.releases[k], model.Revision{Number: 4, Status: model.StatusPendingUpgrade, Updated: t0})
-	return n, err
 }
 
 func TestFixTidiesRevisionsLeftPending(t *testing.T) {
@@ -474,7 +434,7 @@ func TestFixTidiesRevisionsLeftPending(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit = %d\n%s", code, out)
 	}
-	assertCalls(t, f, "rollback 2", "mark-failed 3")
+	assertCalls(t, f, "mark-failed 3", "rollback 2")
 	if statusOf(f, 3) != model.StatusFailed {
 		t.Errorf("rev3 = %s, want failed", statusOf(f, 3))
 	}
@@ -524,7 +484,7 @@ func TestFixUnknownNeedsForceUnknown(t *testing.T) {
 	if code != ExitOK || !strings.Contains(out, "Warning:") {
 		t.Fatalf("forced: exit = %d\n%s", code, out)
 	}
-	assertCalls(t, f, "rollback 2")
+	assertCalls(t, f, "mark-failed 3", "rollback 2")
 }
 
 func TestFixDryRun(t *testing.T) {
@@ -560,7 +520,7 @@ func TestFixConfirmation(t *testing.T) {
 		if code != ExitOK || !strings.Contains(out, "Proceed? [y/N]") {
 			t.Errorf("exit = %d\n%s", code, out)
 		}
-		assertCalls(t, f, "rollback 2")
+		assertCalls(t, f, "mark-failed 3", "rollback 2")
 	})
 	t.Run("interactive no", func(t *testing.T) {
 		f := stuckUpgrade()
@@ -752,6 +712,7 @@ func TestGlobalFlagsReachTheFactory(t *testing.T) {
 func TestShellQuote(t *testing.T) {
 	for in, want := range map[string]string{
 		"kind-e2e": "kind-e2e", "": "''", "my ctx": "'my ctx'", "it's": `'it'\''s'`,
+		"arn:aws:eks:eu/x@y=1+2,3": "arn:aws:eks:eu/x@y=1+2,3", "hu{a,b}": "'hu{a,b}'", "#c": "'#c'", "a~b": "'a~b'", "é": "'é'",
 	} {
 		if got := shellQuote(in); got != want {
 			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
@@ -778,7 +739,7 @@ func TestHelmTimeoutDecidesWhenAWaitingReleaseIsStale(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("with the default 5m timeout the record is past 3 x 5m plus grace, the worst case of helm's phases: exit = %d\n%s", code, out)
 	}
-	assertCalls(t, f, "rollback 1")
+	assertCalls(t, f, "mark-failed 2", "rollback 1")
 }
 
 func TestFixReinspectsAfterConfirmation(t *testing.T) {
@@ -812,24 +773,6 @@ func TestMarkFailedNeverOverwritesARecordThatMoved(t *testing.T) {
 	}
 }
 
-func TestAutoStrategyFallsBackOnlyOnThePendingRefusal(t *testing.T) {
-	for name, err := range map[string]error{
-		"rbac":       errors.New(`secrets is forbidden: User "ci" cannot create resource "secrets"`),
-		"transport":  errors.New("dial tcp 10.0.0.1:443: i/o timeout"),
-		"validation": errors.New("release has no revision 9"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := stuckUpgrade()
-			f.failRollback, f.rollbackErr = true, err
-			code, _, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
-			if code != ExitError || !strings.Contains(errOut, err.Error()) {
-				t.Errorf("exit = %d, stderr = %q", code, errOut)
-			}
-			assertCalls(t, f, "rollback 2")
-		})
-	}
-}
-
 func TestFixReportsTheRevisionItCreated(t *testing.T) {
 	f := stuckUpgrade()
 	// another deploy lands right after our rollback: the head is no longer our revision
@@ -859,11 +802,7 @@ func TestFailedRollbackIsNotBlamedOnAConcurrentChange(t *testing.T) {
 	if !strings.Contains(errOut, "revision 4") || !strings.Contains(errOut, "timed out") {
 		t.Errorf("the error must name the revision the rollback wrote and the cause: %q", errOut)
 	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "mark-failed") {
-			t.Errorf("no retry after the rollback already wrote a revision: %v", f.calls)
-		}
-	}
+	assertCalls(t, f, "mark-failed 3", "rollback 2") // no retry after the rollback wrote a revision
 }
 
 func TestFixStopsBeforeWritingWhenInterrupted(t *testing.T) {
@@ -928,7 +867,7 @@ func TestFixToRevisionRollsBackToASupersededRevision(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit = %d\n%s", code, out)
 	}
-	assertCalls(t, f, "rollback 2")
+	assertCalls(t, f, "mark-failed 3", "rollback 2")
 
 	for _, bad := range []string{"3", "9", "0", "-1"} {
 		f = hist()
@@ -962,7 +901,7 @@ func TestRollbackIsConditionalOnTheInspectedRecord(t *testing.T) {
 	f := stuckUpgrade()
 	f.releases[key{"prod", "web"}][2].Version = "100"
 	f.beforeRollback = func() { f.releases[key{"prod", "web"}][2].Version = "101" }
-	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
+	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes", "--strategy", "direct")
 	if code != ExitError || !strings.Contains(errOut, "changed since it was inspected") {
 		t.Errorf("exit = %d, stderr = %q\n%s", code, errOut, out)
 	}
@@ -1003,23 +942,18 @@ func TestFixChecksTheRecordAgainAfterTheSecondInspection(t *testing.T) {
 	}
 }
 
-func TestRollbackAfterMarkFailedIsGuardedWithTheNewRecord(t *testing.T) {
+func TestClaimGuardsTheClaimAndTheRollbackWithTheRightRecords(t *testing.T) {
 	f := stuckUpgrade()
-	f.refusePending = true
 	f.releases[key{"prod", "web"}][2].Version = "100"
 	code, out, errOut := run(t, f, "", false, "fix", "web", "-n", "prod", "--yes")
 	if code != ExitOK {
 		t.Fatalf("exit = %d\n%s\n%s", code, out, errOut)
 	}
-	if len(f.rollbackFrom) != 2 {
+	if len(f.rollbackFrom) != 1 {
 		t.Fatalf("rollback guards = %+v", f.rollbackFrom)
 	}
-	first, second := f.rollbackFrom[0], f.rollbackFrom[1]
-	if first.Status != model.StatusPendingUpgrade || first.Version != "100" {
-		t.Errorf("first rollback guard = %+v, want the inspected pending record", first)
-	}
-	if second.Status != model.StatusFailed || second.Version != "100+" {
-		t.Errorf("second rollback guard = %+v, want the record mark-failed just wrote", second)
+	if g := f.rollbackFrom[0]; g.Status != model.StatusFailed || g.Version != "100+" {
+		t.Errorf("rollback guard = %+v, want the record the claim just wrote", g)
 	}
 }
 
@@ -1035,7 +969,7 @@ func TestInterruptDuringRollbackDoesNotAbortTheWrite(t *testing.T) {
 	if !strings.Contains(errOut, "rollback completed") || !strings.Contains(errOut, "revision 4") {
 		t.Errorf("the report must say the write finished and which revision it made: %q", errOut)
 	}
-	assertCalls(t, f, "rollback 2") // finished, and nothing further started
+	assertCalls(t, f, "mark-failed 3", "rollback 2") // finished, and nothing further started
 	if statusOf(f, 4) != model.StatusDeployed {
 		t.Errorf("rev4 = %s", statusOf(f, 4))
 	}

@@ -173,3 +173,36 @@ func TestWrittenTakesTheLatestTimestamp(t *testing.T) {
 		t.Errorf("written = %v", got)
 	}
 }
+
+func TestMarkRecordFailedChecksCancellationBetweenReadAndWrite(t *testing.T) {
+	for _, drv := range []string{"", "configmap"} {
+		t.Run("driver="+drv, func(t *testing.T) {
+			var kc *fake.Clientset
+			resource := "secrets"
+			if drv == "configmap" {
+				resource = "configmaps"
+				kc = fake.NewSimpleClientset(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1.web.v3", Namespace: "prod", ResourceVersion: "42",
+						Labels: map[string]string{"owner": "helm", "name": "web", "version": "3", "status": "pending-upgrade"}},
+					Data: map[string]string{"release": string(releaseDoc(t, "pending-upgrade"))},
+				})
+			} else {
+				kc = fake.NewSimpleClientset(secretRecord(t, "42", "pending-upgrade"))
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			kc.PrependReactor("get", resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+				cancel() // Ctrl-C arrives after the read, before the write starts
+				return false, nil, nil
+			})
+			_, err := markRecordFailed(ctx, kc, drv, "prod", "web", pending("42"), "x", clock)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("err = %v, want context.Canceled", err)
+			}
+			for _, a := range kc.Actions() {
+				if a.GetVerb() == "update" {
+					t.Errorf("no update may start after the cancellation: %v", a)
+				}
+			}
+		})
+	}
+}

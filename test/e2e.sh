@@ -225,12 +225,13 @@ scenario_interrupted_upgrade() {
       else
         finding "helm $HELM_MAJOR: a direct SDK rollback is refused on a pending-upgrade revision: $(head -n1 <<<"$ERR")"
         [[ "$(latest_status "$ns" "$rel")" == pending-upgrade ]] || die "a refused direct rollback changed the release"
-        run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --yes --strategy mark-failed
-        expect_rc 0 "fix --strategy mark-failed after a refused direct rollback"
+        run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --yes --strategy claim
+        expect_rc 0 "fix --strategy claim after a refused direct rollback"
       fi
       ;;
     *)
       expect_rc 0 "fix --strategy $strategy"
+      grep -qx "Rollback path: claim-first" <<<"$OUT" || die "scenario 1: expected the claim-first path: $OUT"
       finding "helm $HELM_MAJOR: fix --strategy $strategy: $(grep '^Rollback path' <<<"$OUT")"
       ;;
   esac
@@ -390,7 +391,7 @@ scenario_live_wait_after_deadline() {
   expect_rc 3 "fix right after helm died, inside its timeout"
   pass "the record is still protected until the helm timeout has passed"
 
-  # helm-timeout 5s + 1m grace: the record must be older than 65s
+  # helm-timeout 5s + 1m grace: the record must be older than 75s (3 x 5s + 1m)
   wait_for 150 "the record to outlive the helm timeout" bash -c \
     "'$UNSTICK' scan -n '$ns' --older-than 0s --helm-timeout 5s -o json | jq -e '.[0].verdict == \"stale\"'"
   run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 5s --yes
@@ -488,7 +489,7 @@ scenario_active_hook() {
   grep -qF "hook has not finished" <<<"$OUT" || die "scenario 8: the verdict must name the hook Job: $OUT"
   run "$UNSTICK" fix "$rel" -n "$ns" --older-than 0s --helm-timeout 1m --yes
   expect_rc 3 "fix while the hook Job runs"
-  expect_out "delete the hook" "the refusal says what to do"
+  expect_out "delete the Job/Pod" "the refusal says what to do"
   pass "fix refuses with exit 3 while the hook Job is active"
 
   # 3 x 1s + 1m grace = 63s: past that no helm-timeout signal would count, the running hook still does
@@ -578,8 +579,7 @@ want() {
 }
 
 if want upgrade; then
-  scenario_interrupted_upgrade auto
-  scenario_interrupted_upgrade mark-failed
+  scenario_interrupted_upgrade claim
   scenario_interrupted_upgrade direct
 fi
 if want live; then scenario_live_upgrade; fi

@@ -345,6 +345,9 @@ func markRecordFailed(ctx context.Context, kc kubernetes.Interface, driver, name
 			return model.Revision{}, perr
 		}
 		cm.Data["release"] = string(enc)
+		if cerr := ctx.Err(); cerr != nil { // an interrupt before the write starts stops it
+			return model.Revision{}, cerr
+		}
 		var updated *corev1.ConfigMap
 		updated, err = kc.CoreV1().ConfigMaps(namespace).Update(write, cm, metav1.UpdateOptions{})
 		if err == nil {
@@ -360,6 +363,9 @@ func markRecordFailed(ctx context.Context, kc kubernetes.Interface, driver, name
 			return model.Revision{}, perr
 		}
 		sec.Data["release"] = enc
+		if cerr := ctx.Err(); cerr != nil {
+			return model.Revision{}, cerr
+		}
 		var updated *corev1.Secret
 		updated, err = kc.CoreV1().Secrets(namespace).Update(write, sec, metav1.UpdateOptions{})
 		if err == nil {

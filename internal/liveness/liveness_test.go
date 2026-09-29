@@ -249,7 +249,8 @@ func TestActiveHookWorkIsPermanentButOtherSignalsAreBounded(t *testing.T) {
 		{"hook Job that only started", Ref{Kind: "Job", Name: "j", Hook: true}, `{"status":{}}`, false, true},
 		{"running hook Pod", Ref{Kind: "Pod", Name: "p", Hook: true}, `{"status":{"phase":"Running"}}`, true, false},
 		{"pending hook Pod", Ref{Kind: "Pod", Name: "p", Hook: true}, `{"status":{"phase":"Pending"}}`, false, true},
-		{"active Job of the manifest, not a hook", Ref{Kind: "Job", Name: "j"}, `{"status":{"active":1}}`, false, true},
+		{"active Job of the manifest, not a hook", Ref{Kind: "Job", Name: "j"}, `{"status":{"active":1}}`, true, false},
+		{"non-hook Job that only started", Ref{Kind: "Job", Name: "j"}, `{"status":{}}`, false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -452,5 +453,13 @@ func TestCustomResourceConditions(t *testing.T) {
 	cm := Ref{APIVersion: "v1", Kind: "ConfigMap", Name: "cfg"}
 	if sigs := Inspect(cm, obj(t, `{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`), now, 0); len(sigs) != 0 {
 		t.Errorf("built-in kinds without readiness rules are never waited on: %v", sigs)
+	}
+}
+
+func TestActiveNonHookJobStillRefusesPastTheWaitWindow(t *testing.T) {
+	sigs := Inspect(Ref{Kind: "Job", Name: "j"}, obj(t, `{"status":{"active":1}}`), now, 0)
+	got := verdict.Decide(verdict.Input{Age: 500 * time.Hour, HelmTimeout: time.Minute, Evidence: verdict.Evidence{Signals: sigs}})
+	if got.Verdict != verdict.PossiblyRunning {
+		t.Fatalf("Verdict = %s, want possibly-running: an active Job is real work whatever its age", got.Verdict)
 	}
 }

@@ -182,8 +182,8 @@ func TestActiveHookNeverExpires(t *testing.T) {
 			t.Fatalf("age %s: Verdict = %s, want possibly-running: a running hook is real work whatever the timeout", age, got.Verdict)
 		}
 		joined := strings.Join(got.Reasons, "\n")
-		if !strings.Contains(joined, "Job/migrate") || !strings.Contains(joined, "wait for it to finish or delete the hook") {
-			t.Errorf("age %s: the refusal must tell the user to wait or delete the hook Job:\n%s", age, joined)
+		if !strings.Contains(joined, "Job/migrate") || !strings.Contains(joined, "wait for it to finish or delete the Job/Pod") {
+			t.Errorf("age %s: the refusal must tell the user to wait or delete the Job:\n%s", age, joined)
 		}
 	}
 }

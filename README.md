@@ -7,7 +7,7 @@ $ helm upgrade --install web ./chart -n prod --wait
 Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress
 ```
 
-A CI job was killed mid-deploy, and every deploy since fails with that error. Two commands find out why and fix it. The output below comes from runs on a kind cluster with Helm 3.22.0, edited by hand where the wait window changed from one to three timeouts. The demo release is seconds old, so the runs pass `--older-than 0s` and `--helm-timeout 1s`; the defaults are 10m and 5m.
+A CI job was killed mid-deploy, and every deploy since fails with that error. Two commands find out why and fix it. The output below comes from runs on a kind cluster with Helm 3.22.0. The AGE values vary per run. The demo release is seconds old, so the runs pass `--older-than 0s` and `--helm-timeout 1s`; the defaults are 10m and 5m.
 
 First the helm process is still alive: it waits with `--wait`, its Deployment is past `progressDeadlineSeconds`, and a LoadBalancer Service has no address. Helm 3 keeps waiting in that state, so `fix` refuses:
 
@@ -63,8 +63,8 @@ Commands:
     # the rollback step alone, by hand
 
 Rolling back web to revision 1 ...
-Rollback path: direct
-Revision 2 was left pending-upgrade by the interrupted operation and is now marked failed.
+Marking pending revision 2 as failed first ...
+Rollback path: claim-first
 Done. Release web is deployed as revision 3 (content of revision 1). The next helm upgrade can proceed.
 exit=0
 ```
@@ -104,7 +104,7 @@ They come from the objects in the manifest and the hooks of the pending revision
 2. **What `helm --wait` would still be waiting on.** The rules follow Helm 3's `ReadyChecker` (`pkg/kube/ready.go`), and use the stricter `kubectl rollout status` rules where those differ:
    - Pods must be `Ready`, PersistentVolumeClaims `Bound`, Services must have a cluster IP and, for a `LoadBalancer` without external IPs, an ingress address;
    - Deployments: the controller must have observed the latest generation before any condition counts. A Deployment past its progress deadline still counts: Helm 3 keeps waiting there (Helm 4 stops). StatefulSets honor `partition` and `currentRevision`/`updateRevision`. DaemonSets, ReplicaSets and CRDs (`Established`) are checked too;
-   - Jobs that have neither completed nor failed, and hook Pods that have not finished. An **active hook Job or a running hook Pod is real work**: it keeps running after helm is killed, no timeout ends it, and it blocks `fix` whatever the age of the record (see below);
+   - Jobs that have neither completed nor failed, and hook Pods that have not finished. An **active Job (hook or not) or a running hook Pod is real work**: it keeps running after helm is killed, no timeout ends it, and it blocks `fix` whatever the age of the record (see below);
    - ReplicationControllers whose controller has not observed the latest spec or whose replicas are not ready;
    - custom resources that report `Ready=False` or `Reconciling=True` (what Helm 4 waits on).
 3. Objects whose name Kubernetes picked (`generateName`) are found by name prefix and creation time, and only counted when they belong to the release: the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations Helm stamps, the `app.kubernetes.io/instance` label, or a label the hook manifest rendered with the release name as its value. An object that carries another release's annotation or instance label is ignored. One that carries no proof either way is not guessed about: the check is reported as incomplete and the verdict becomes `unknown`.
@@ -113,7 +113,7 @@ How long each kind of activity counts:
 
 - **Recent changes** (1) count while they are inside the `--older-than` window.
 - **Things a helm `--wait` may still be waiting on** (2, except running hooks) count while the pending record is younger than **3 x `--helm-timeout` plus one minute of grace**. Helm applies `--timeout` to the pre-hooks, to the wait and to the post-hooks separately (`pkg/action/upgrade.go`), so a live helm can hold a release pending for three timeouts in a row. `--older-than` still applies on top.
-- **A running hook Job or Pod** never expires. The refusal says to wait for it to finish, or to delete the hook Job if it is orphaned.
+- **An active Job or a running hook Pod** never expires. The refusal says to wait for it to finish, or to delete the Job/Pod if it is orphaned.
 
 **Set `--helm-timeout` to the `--timeout` your deploys pass to helm** (default 5m, Helm's own default). If it is smaller than the real one, `fix` can decide that a live helm is dead: it rolls back while that helm is still waiting. When that helm finally finishes, it writes its own revision next to the rollback's, so the history ends with two `deployed` revisions and the cluster holds whichever state was applied last (in the reproduced case the rolled-back one). Nothing in the cluster tells a dead helm from a slow one, so the flag is the only place that knowledge can come from.
 
@@ -121,7 +121,7 @@ How long each kind of activity counts:
 
 - an object cannot be read (`Forbidden`, API errors);
 - the cluster does not serve the kind of an object in the manifest (CRD not installed, API version removed), even after trying the other served versions;
-- objects with a generated name match the prefix but carry no proof of belonging to the release;
+- objects with a generated name match the prefix but carry no proof of belonging to the release. Only Helm's `meta.helm.sh/release-name` and `-namespace` annotations naming another release rule an object out; the `app.kubernetes.io/instance` label is only a recommendation and proves nothing against it. A match on the release name in a rendered label, or on the manifest's `helm.sh/hook` value, proves it is ours;
 - the record has no timestamp, or the storage records cannot be listed;
 - a check fails halfway.
 
@@ -133,8 +133,8 @@ A release whose storage records cannot be trusted is never guessed at: `explain`
 - The history is built from one list call, so the status, `resourceVersion` and write time of every revision describe the same moment.
 - After the confirmation prompt (and with `--yes`, right before acting) `fix` reads the history and inspects the cluster again. It stops if the record changed or the verdict is not the same as the one it showed. The record is compared once more after that second inspection, right before the write.
 - Marking a revision `failed` is conditional. The write carries the `resourceVersion` of the record that was inspected, so the API server rejects it if anything touched the record since, and a record that is no longer pending (a live helm just finished) is never rewritten.
-- Rollback and uninstall are conditional in the same way as far as the SDK allows: immediately before the SDK call the pending record is read again and must have the inspected status and `resourceVersion`. The Helm SDK takes no precondition, so a small window remains between that read and the SDK's own first write (a few milliseconds up to the time Helm needs to load the release). A helm that starts inside it is not seen. After a `mark-failed` step the rollback is guarded with the record that step wrote.
-- `--strategy auto` falls back to mark-failed only when Helm refused with "another operation is in progress". RBAC, transport and validation errors are returned without further writes.
+- Rollback and uninstall are conditional in the same way as far as the SDK allows: immediately before the SDK call the pending record is read again and must have the inspected status and `resourceVersion`. The Helm SDK takes no precondition, so a small window remains between that read and the SDK's own first write (a few milliseconds up to the time Helm needs to load the release). A helm that starts inside it is not seen. After the claim the rollback is guarded with the record the claim wrote.
+- The default `--strategy claim` first marks the inspected pending record `failed` with the conditional write above, then rolls back guarded by the record that write produced. See "How the rollback runs" for the window that stays.
 - After a rollback, `fix` checks the revision it created itself. If another operation wrote a newer revision meanwhile, it reports the concurrent operation instead of success.
 - The confirmation prompt ends on Ctrl-C. Ctrl-C and SIGTERM stop the command before its next write. A rollback or uninstall that is already running is not abandoned half-way: the first Ctrl-C prints "finishing the current write, press Ctrl-C again to abort" and lets the SDK call complete, then the command reports what was written and stops. An older revision that still says `pending-*` is left as it is: Helm only looks at the latest revision. A second Ctrl-C aborts at once and can leave a half-written release.
 
@@ -167,13 +167,17 @@ Without the flag `fix` prints the options with exact commands and exits with cod
 | Helm 3.22.0 | direct rollback works | direct rollback works |
 | Helm 4.3.0 | direct rollback works | direct rollback works |
 
-So no `pending -> failed` step is needed first, and `--strategy mark-failed` (which does that step and then rolls back) works as well. `auto` keeps the fallback in case a future Helm refuses. Choose with `--strategy`:
+The SDK would accept a direct rollback, but that leaves a race: the record is read, then the SDK writes, and Helm has no lock. So the default claims first:
+
+1. `fix` marks the pending record `failed` with an update that carries its `resourceVersion`. If a live helm finished or wrote to the record since the inspection, the API server rejects the update and nothing else happens.
+2. The rollback runs, guarded by the `resourceVersion` the claim produced.
+
+What remains: a live helm that the checks could not detect (no visible signs of life, finished its last write before the claim) can still write after the claim, and Helm offers nothing that would stop it. A helm that is running and writes its next status after the claim overwrites the failed record. The claim narrows the window to the API round trip and makes it fail loudly whenever the record moved before the claim. If the rollback fails after the claim, the revision stays `failed`, which no longer blocks helm; the error gives the `helm rollback` command to retry.
 
 | Strategy | Behavior |
 | --- | --- |
-| `auto` (default) | Try the rollback directly. If Helm refuses with "another operation is in progress" and the pending record is untouched, mark it `failed` and try again. Any other error is returned as it is. |
-| `direct` | Try the rollback directly and report the error. |
-| `mark-failed` | Mark the pending revision `failed`, then roll back. |
+| `claim` (default) | Mark the inspected pending record `failed` conditionally, then roll back guarded by the new record version. Output: `Rollback path: claim-first`. |
+| `direct` | Roll back with only the read-and-compare guard right before the SDK call. A small window remains before the SDK's first write. Output: `Rollback path: direct`. |
 
 The output names the path that worked (`Rollback path: ...`). `make e2e` prints the path each run took.
 
@@ -195,7 +199,7 @@ helm-unstick scan    [-n NAMESPACE | -A] [--older-than 10m] [--helm-timeout 5m] 
 helm-unstick explain RELEASE [-n NAMESPACE] [--older-than 10m] [--helm-timeout 5m]
 helm-unstick fix     RELEASE [-n NAMESPACE] [--dry-run] [--yes] [--older-than 10m] [--helm-timeout 5m]
                      [--force-unknown] [--first-install uninstall|mark-failed] [--to-revision N]
-                     [--strategy auto|direct|mark-failed] [--wait] [--timeout 5m]
+                     [--strategy claim|direct] [--wait] [--timeout 5m]
 ```
 
 Common flags: `--kube-context`, `--kubeconfig` (`KUBECONFIG` works as in kubectl), `--driver secret|configmap` (default `$HELM_DRIVER`, then `secret`). The commands printed in plans repeat `--kube-context` and `--kubeconfig`, and add `HELM_DRIVER=...` whenever `--driver` was given (also `secret`, so it beats a `HELM_DRIVER` the shell inherited), so a pasted `helm rollback` acts on the cluster that was analyzed. Under `helm unstick` Helm swallows `--kube-context` and `--kubeconfig` and passes them on as `HELM_KUBECONTEXT` and `KUBECONFIG`; the printed commands are rebuilt from those variables (a `KUBECONFIG` list is kept as `KUBECONFIG=...`).
@@ -303,7 +307,7 @@ The e2e script (`test/e2e.sh`) uses the Helm CLI under test to start `helm upgra
 2. A live slow upgrade is `possibly-running`, `fix` exits with 3, and `--force-unknown` does not change that.
 3. An interrupted first install: `fix` alone prints the plan and changes nothing. Then `--first-install=mark-failed` lets `helm upgrade --install` pass, and `--first-install=uninstall` lets `helm install` pass.
 4. An interrupted rollback returns to the last deployed revision.
-5. Helm 3 only: `helm upgrade --wait` keeps waiting after the Deployment exceeded its progress deadline. While that helm is alive `fix` refuses with 3, also right after it is killed. Once the record is older than the helm timeout plus grace, `fix` recovers and the history has exactly one `deployed` revision.
+5. Helm 3 only: `helm upgrade --wait` keeps waiting after the Deployment exceeded its progress deadline. While that helm is alive `fix` refuses with 3, also right after it is killed. Once the record is older than 3 x the helm timeout plus grace, `fix` recovers and the history has exactly one `deployed` revision.
 6. Helm 3 only: a LoadBalancer Service without an ingress address keeps helm waiting; the verdict names the Service and `fix` refuses. Helm 4.3.0 does not wait for the address.
 7. A release record that does not decode makes `scan` exit with 1 and name the record.
 8. A pre-upgrade hook Job that runs for 100 seconds outlives the killed helm. `fix` refuses with 3 while the Job is active, also when the record is older than 3 x the helm timeout plus grace and with `--force-unknown`, and recovers once the Job is done.

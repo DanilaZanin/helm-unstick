@@ -106,9 +106,10 @@ func TestGeneratedNamesNeedProofOfOwnership(t *testing.T) {
 		withMeta(object("batch/v1", "Job", "prod", "migrate-inst02", fresh), map[string]string{"app.kubernetes.io/instance": "web"}, nil),
 		withMeta(object("batch/v1", "Job", "prod", "migrate-rndr03", fresh), map[string]string{"release": "web"}, nil),
 		withMeta(object("batch/v1", "Job", "prod", "migrate-foreign1", fresh), nil, otherRelease),
-		withMeta(object("batch/v1", "Job", "prod", "migrate-foreign2", fresh), map[string]string{"app.kubernetes.io/instance": "api"}, nil),
 		withMeta(object("batch/v1", "Job", "prod", "migrate-samens-other", fresh), nil, map[string]string{"meta.helm.sh/release-name": "web", "meta.helm.sh/release-namespace": "dev"}),
 		object("batch/v1", "Job", "prod", "migrate-bare04", fresh),
+		// the instance label is only a recommendation: a different value proves nothing
+		withMeta(object("batch/v1", "Job", "prod", "migrate-inst-other", fresh), map[string]string{"app.kubernetes.io/instance": "api"}, nil),
 	)
 	got, unproven, err := k.fetch(context.Background(), ref, start.Add(-generatedSlack), webOwner)
 	if err != nil {
@@ -118,7 +119,7 @@ func TestGeneratedNamesNeedProofOfOwnership(t *testing.T) {
 	if strings.Join(sorted(names(got)), " ") != want {
 		t.Errorf("owned = %v, want %s: a foreign release's object must never be inspected", names(got), want)
 	}
-	if len(unproven) != 1 || unproven[0] != "migrate-bare04" {
+	if strings.Join(unproven, " ") != "migrate-bare04 migrate-inst-other" {
 		t.Errorf("unproven = %v: an object with no ownership metadata cannot be included, and must not be silently dropped either", unproven)
 	}
 }
@@ -126,4 +127,21 @@ func TestGeneratedNamesNeedProofOfOwnership(t *testing.T) {
 func sorted(s []string) []string {
 	sort.Strings(s)
 	return s
+}
+
+func TestHookWithADifferentInstanceLabelIsStillOursByItsHookAnnotation(t *testing.T) {
+	start := clock
+	ref := liveness.Ref{APIVersion: "batch/v1", Kind: "Job", Namespace: "prod", GenerateName: "migrate-", Hook: true, HookKinds: "post-upgrade,pre-upgrade"}
+	hookAnn := map[string]string{"helm.sh/hook": "pre-upgrade, post-upgrade"}
+	k := testAccess(t,
+		withMeta(object("batch/v1", "Job", "prod", "migrate-a1", start.Add(time.Minute)), map[string]string{"app.kubernetes.io/instance": "worker"}, hookAnn),
+		withMeta(object("batch/v1", "Job", "prod", "migrate-b2", start.Add(time.Minute)), nil, map[string]string{"helm.sh/hook": "pre-install"}),
+	)
+	got, unproven, err := k.fetch(context.Background(), ref, start.Add(-generatedSlack), webOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names(got), " ") != "migrate-a1" || strings.Join(unproven, " ") != "migrate-b2" {
+		t.Errorf("owned = %v, unproven = %v: instance=worker must not hide our hook, and a different hook must not be assumed ours", names(got), unproven)
+	}
 }

@@ -48,8 +48,8 @@ some release could not be read (the scan is incomplete and never reports "nothin
   --helm-timeout DURATION  the --timeout of your helm deploys (default 5m). Objects a live
                          helm --wait would still wait on block the verdict until the record
                          is older than 3 x this plus one minute (helm applies --timeout to
-                         pre-hooks, wait and post-hooks separately). A running hook Job or
-                         Pod blocks it whatever the age
+                         pre-hooks, wait and post-hooks separately). An active Job or
+                         a running hook Pod blocks it whatever the age
   -o, --output FORMAT    table (default) or json
 `
 

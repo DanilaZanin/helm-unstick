@@ -48,7 +48,7 @@ type Signal struct {
 	// after another, so the signal stops counting once the pending record is older than
 	// WaitWindow(--helm-timeout).
 	Bounded bool
-	// Permanent marks real work in progress: an active hook Job or a running hook Pod.
+	// Permanent marks real work in progress: an active Job or a running hook Pod.
 	// Helm's timeout does not end it (the workload keeps running after helm is killed), so it
 	// never expires. The user waits for it or deletes it.
 	Permanent bool
@@ -113,7 +113,7 @@ func Decide(in Input) Result {
 		case s.Permanent:
 			running = true
 			res.Reasons = append(res.Reasons, fmt.Sprintf(
-				"%s [real work is running and no timeout ends it: wait for it to finish or delete the hook Job/Pod if it is orphaned]", s))
+				"%s [real work is running and no timeout ends it: wait for it to finish or delete the Job/Pod if it is orphaned]", s))
 		case s.Bounded && age > waitLimit:
 			expired = append(expired, s.Object)
 		case s.Bounded:

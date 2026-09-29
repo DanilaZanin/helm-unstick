@@ -24,7 +24,7 @@ Recovers a release stuck in a pending-* state. Acts only when the verdict is "st
   --helm-timeout DURATION  the --timeout your deploys pass to helm (default 5m). A live
                          helm --wait may still be waiting on a not-ready Pod, volume, load
                          balancer or rollout until the record is older than 3 x this plus
-                         1m. A running hook Job or Pod blocks fix whatever the age
+                         1m. An active Job or a running hook Pod blocks fix whatever the age
   --force-unknown        act although liveness could not be verified. It never
                          overrides "possibly-running"
   --first-install MODE   what to do when there is no deployed revision to return to:
@@ -35,12 +35,11 @@ Recovers a release stuck in a pending-* state. Acts only when the verdict is "st
                          deployed revision but has a superseded one (an operation was
                          interrupted between Helm's two writes). Never chosen for you
   --strategy S           how to roll back a pending revision:
-                         auto (default)  try the rollback directly, and if Helm refuses it
-                                         with "another operation is in progress" while the
-                                         revision is untouched, mark it failed and retry.
-                                         Any other error is returned without further writes
-                         direct          rollback only
-                         mark-failed     mark the pending revision failed, then roll back
+                         claim (default)  mark the inspected pending record failed with a
+                                          conditional write (fails if anything changed it),
+                                          then roll back guarded by that record
+                         direct           roll back with only a read-and-compare guard, a
+                                          small window remains before the SDK's first write
   --wait                 wait for the rollback/uninstall to become ready
   --timeout DURATION     timeout for hooks and --wait (default 5m)
 
@@ -88,7 +87,7 @@ func runFix(ctx context.Context, args []string, env Env, newBackend Factory) int
 	fs.BoolVar(&o.forceUnknown, "force-unknown", false, "")
 	fs.BoolVar(&o.wait, "wait", false, "")
 	fs.StringVar(&firstRaw, "first-install", "", "")
-	fs.StringVar(&o.strategy, "strategy", "auto", "")
+	fs.StringVar(&o.strategy, "strategy", "claim", "")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return parseFailure(err, env, "fix", fixHelp)
@@ -104,9 +103,9 @@ func runFix(ctx context.Context, args []string, env Env, newBackend Factory) int
 		return fail(env, "%v", err)
 	}
 	switch o.strategy {
-	case "auto", "direct", "mark-failed":
+	case "claim", "direct":
 	default:
-		return fail(env, "unsupported --strategy %q: use auto, direct or mark-failed", o.strategy)
+		return fail(env, "unsupported --strategy %q: use claim or direct", o.strategy)
 	}
 	be, err := newBackend(c.Global)
 	if err != nil {
@@ -347,8 +346,7 @@ func rollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck, ta
 	wrote := func(created int, err error) error {
 		return fmt.Errorf("the rollback wrote revision %d but did not complete: %w; check \"helm history %s -n %s\" before doing anything else", created, err, s.Release, s.Namespace)
 	}
-	switch strategy {
-	case "direct":
+	if strategy == "direct" {
 		created, err := roll(s.Pending)
 		if created != 0 && err != nil {
 			return 0, "", wrote(created, err)
@@ -357,54 +355,23 @@ func rollback(ctx context.Context, out io.Writer, be Backend, s *model.Stuck, ta
 			return 0, "", fmt.Errorf("rollback failed: %w", err)
 		}
 		return created, "direct", nil
-	case "mark-failed":
-		failed, err := markFirst(s.Pending)
-		if err != nil {
-			return 0, "", err
-		}
-		created, err := roll(failed)
-		if created != 0 && err != nil {
-			return 0, "", wrote(created, err)
-		}
-		if err != nil {
-			return 0, "", fmt.Errorf("rollback failed after marking revision %d failed: %w", s.Pending.Number, err)
-		}
-		return created, "mark-failed-first", nil
 	}
-
-	// auto: try the plain rollback. Fall back to mark-failed only when Helm refused because of
-	// the pending revision and the record is still exactly as it was inspected.
-	created, err := roll(s.Pending)
-	if err == nil {
-		return created, "direct", nil
-	}
-	if created != 0 {
-		return 0, "", wrote(created, err)
-	}
-	if !errors.Is(err, model.ErrPending) {
-		return 0, "", fmt.Errorf("rollback failed: %w", err)
-	}
-	fmt.Fprintf(out, "Direct rollback refused: %v\n", err)
-	h, herr := be.History(ctx, s.Namespace, s.Release)
-	if herr != nil {
-		return 0, "", fmt.Errorf("rollback failed (%w) and the history could not be re-read: %w", err, herr)
-	}
-	cur := model.Analyze(h)
-	if cur == nil || cur.Pending.Number != s.Pending.Number || cur.Pending.Status != s.Pending.Status || cur.Pending.Version != s.Pending.Version {
-		return 0, "", fmt.Errorf("rollback was refused and the release history changed since it was inspected, so it was not retried: %w", err)
-	}
-	failed, err := markFirst(cur.Pending)
+	// claim (default): the inspected pending record is marked failed first, conditionally on
+	// its resourceVersion, so a helm that finished or wrote to it meanwhile makes the claim
+	// fail instead of being overwritten. The rollback is then guarded by the record the claim
+	// wrote. A live helm that cannot be detected can still write after the claim: Helm has no lock.
+	failed, err := markFirst(s.Pending)
 	if err != nil {
 		return 0, "", err
 	}
-	created, err = roll(failed)
+	created, err := roll(failed)
 	if created != 0 && err != nil {
 		return 0, "", wrote(created, err)
 	}
 	if err != nil {
-		return 0, "", fmt.Errorf("rollback failed again after marking revision %d failed: %w", s.Pending.Number, err)
+		return 0, "", fmt.Errorf("rollback failed after marking revision %d failed: %w; the revision stays failed, which no longer blocks helm; retry with \"helm rollback %s %d -n %s\"", s.Pending.Number, err, s.Release, target, s.Namespace)
 	}
-	return created, "direct rollback refused, mark-failed-first worked", nil
+	return created, "claim-first", nil
 }
 
 func latestRevision(ctx context.Context, be Backend, s *model.Stuck) (model.Revision, error) {

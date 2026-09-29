@@ -88,7 +88,7 @@ func appendRefs(refs []liveness.Ref, doc map[string]interface{}, defaultNamespac
 	if name != "" {
 		generateName = ""
 	}
-	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, GenerateName: generateName, Hook: hook, Labels: joinLabels(metadata["labels"])})
+	return append(refs, liveness.Ref{APIVersion: apiVersion, Kind: kind, Namespace: namespace, Name: name, GenerateName: generateName, Hook: hook, Labels: joinLabels(metadata["labels"]), HookKinds: hookKinds(metadata["annotations"])})
 }
 
 // joinLabels spells the labels of a manifest document as sorted key=value pairs.
@@ -102,4 +102,14 @@ func joinLabels(v interface{}) string {
 	}
 	sort.Strings(pairs)
 	return strings.Join(pairs, ",")
+}
+
+// hookKinds returns the normalized helm.sh/hook annotation, empty when there is none.
+func hookKinds(v interface{}) string {
+	m, _ := v.(map[string]interface{})
+	s, _ := m[annotationHook].(string)
+	if s == "" {
+		return ""
+	}
+	return normalizeHooks(s)
 }

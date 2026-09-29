@@ -135,7 +135,7 @@ Usage:
   %[1]s explain RELEASE [-n NAMESPACE] [--older-than 10m] [--helm-timeout 5m]
   %[1]s fix     RELEASE [-n NAMESPACE] [--dry-run] [--yes] [--older-than 10m] [--helm-timeout 5m]
                 [--force-unknown] [--first-install uninstall|mark-failed] [--to-revision N]
-                [--strategy auto|direct|mark-failed] [--wait] [--timeout 5m]
+                [--strategy claim|direct] [--wait] [--timeout 5m]
   %[1]s version
 
 Common flags:
@@ -153,8 +153,8 @@ Exit codes:
 --helm-timeout: set it to the --timeout your deploys pass to helm (default 5m, Helm's own
 default). Helm applies --timeout to the pre-hooks, the wait and the post-hooks separately,
 so a live helm --wait may still be waiting on a not-ready Pod, volume, load balancer or
-rollout until the record is older than 3 x that timeout plus a minute. A running hook Job
-or Pod blocks fix whatever the age: wait for it, or delete it if it is orphaned.
+rollout until the record is older than 3 x that timeout plus a minute. An active Job or
+a running hook Pod blocks fix whatever the age: wait for it, or delete it if it is orphaned.
 A value smaller than the real --timeout can let fix roll back under a live helm.
 
 fix acts only on releases with verdict "stale". Run "%[1]s explain RELEASE" to see why.
@@ -293,7 +293,16 @@ func passthrough(fs *flag.FlagSet, names ...string) []string {
 }
 
 func shellQuote(s string) string {
-	if s != "" && !strings.ContainsAny(s, " \t\n'\"$`\\!*?;&|<>()") {
+	// Only characters that no shell treats specially stay bare; everything else is quoted.
+	safe := s != ""
+	for _, r := range s {
+		alnum := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !alnum && !strings.ContainsRune("._/:@=+,-", r) {
+			safe = false
+			break
+		}
+	}
+	if safe {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
