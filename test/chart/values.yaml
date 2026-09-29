@@ -1,0 +1,7 @@
+# Seconds the container waits before it reports ready. Long delays keep helm --wait busy.
+readinessDelay: 0
+
+# Any change to this value changes the pod template, which forces a new rollout.
+rollout: "1"
+
+image: busybox:1.36

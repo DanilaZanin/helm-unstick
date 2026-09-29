@@ -1,0 +1,6 @@
+apiVersion: v2
+name: slowapp
+description: Test chart whose pod becomes ready only after readinessDelay seconds.
+type: application
+version: 0.1.0
+appVersion: "1.0"

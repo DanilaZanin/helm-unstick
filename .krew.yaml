@@ -1,0 +1,61 @@
+# Krew plugin manifest template for krew-release-bot (rajatjindal/krew-release-bot).
+# It renders this file for each release tag and opens a PR against krew-index.
+# The archive names must match .goreleaser.yaml (helm-unstick_<tag>_<os>_<arch>.tar.gz).
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: unstick
+spec:
+  version: {{ .TagName }}
+  homepage: https://github.com/DanilaZanin/helm-unstick
+  shortDescription: Recover Helm releases stuck in a pending state
+  description: |
+    Finds Helm releases whose latest revision is pending-install, pending-upgrade or
+    pending-rollback, checks whether the operation could still be running, and recovers
+    the ones that are dead: rollback to the last deployed revision, or a choice for an
+    interrupted first install. It leaves anything that might be alive alone.
+  platforms:
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: amd64
+      {{addURIAndSha "https://github.com/DanilaZanin/helm-unstick/releases/download/{{ .TagName }}/helm-unstick_{{ .TagName }}_darwin_amd64.tar.gz" .TagName }}
+      bin: kubectl-unstick
+      files:
+        - from: kubectl-unstick
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: arm64
+      {{addURIAndSha "https://github.com/DanilaZanin/helm-unstick/releases/download/{{ .TagName }}/helm-unstick_{{ .TagName }}_darwin_arm64.tar.gz" .TagName }}
+      bin: kubectl-unstick
+      files:
+        - from: kubectl-unstick
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: linux
+          arch: amd64
+      {{addURIAndSha "https://github.com/DanilaZanin/helm-unstick/releases/download/{{ .TagName }}/helm-unstick_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
+      bin: kubectl-unstick
+      files:
+        - from: kubectl-unstick
+          to: .
+        - from: LICENSE
+          to: .
+    - selector:
+        matchLabels:
+          os: linux
+          arch: arm64
+      {{addURIAndSha "https://github.com/DanilaZanin/helm-unstick/releases/download/{{ .TagName }}/helm-unstick_{{ .TagName }}_linux_arm64.tar.gz" .TagName }}
+      bin: kubectl-unstick
+      files:
+        - from: kubectl-unstick
+          to: .
+        - from: LICENSE
+          to: .

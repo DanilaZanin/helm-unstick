@@ -1,0 +1,56 @@
+version: 2
+
+project_name: helm-unstick
+
+# One binary, two names: helm-unstick (standalone and Helm plugin) and kubectl-unstick
+# (kubectl plugin, found on PATH as "kubectl unstick").
+builds:
+  - id: helm-unstick
+    main: ./cmd/helm-unstick
+    binary: helm-unstick
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+  - id: kubectl-unstick
+    main: ./cmd/helm-unstick
+    binary: kubectl-unstick
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: unstick
+    ids: [helm-unstick, kubectl-unstick]
+    formats: [tar.gz]
+    # The tag keeps its "v", so scripts/install-binary.sh and .krew.yaml can build the URL from it.
+    name_template: "{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  github:
+    owner: DanilaZanin
+    name: helm-unstick

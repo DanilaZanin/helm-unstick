@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: vet, lint, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14
+      - name: unit tests
+        run: make test GOTESTFLAGS=-race
+
+  e2e:
+    name: e2e (Helm ${{ matrix.helm }} on kind)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        helm: ["3", "4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install Helm ${{ matrix.helm }}
+        id: helm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "bin=$(test/install-helm.sh '${{ matrix.helm }}' "$RUNNER_TEMP/helm${{ matrix.helm }}")" >> "$GITHUB_OUTPUT"
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: helm-unstick-e2e
+      - name: Build
+        run: make build
+      - name: e2e
+        env:
+          HELM: ${{ steps.helm.outputs.bin }}
+          E2E_USE_CURRENT_CONTEXT: "1"
+          E2E_CLUSTER: helm-unstick-e2e
+        run: test/e2e.sh
+
+  snapshot:
+    name: goreleaser snapshot
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean

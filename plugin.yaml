@@ -1,0 +1,10 @@
+name: "unstick"
+version: "0.1.0"
+usage: "helm unstick <scan|explain|fix> [flags]"
+description: |-
+  Finds Helm releases stuck in pending-install, pending-upgrade or pending-rollback
+  and recovers them, but only when nothing shows the operation is still running.
+command: "$HELM_PLUGIN_DIR/bin/helm-unstick"
+hooks:
+  install: "$HELM_PLUGIN_DIR/scripts/install-binary.sh"
+  update: "$HELM_PLUGIN_DIR/scripts/install-binary.sh"
