@@ -287,7 +287,14 @@ As a kubectl plugin, put `kubectl-unstick` on your `PATH`:
 $ kubectl unstick scan -A
 ```
 
-With Krew, once the plugin is in the index: `kubectl krew install unstick`. The manifest template for the release bot is `.krew.yaml`.
+With Krew, from my index ([DanilaZanin/krew-index](https://github.com/DanilaZanin/krew-index), not the central one):
+
+```console
+$ kubectl krew index add danilazanin https://github.com/DanilaZanin/krew-index.git
+$ kubectl krew install danilazanin/unstick
+```
+
+`.krew.yaml` is the manifest template for the central krew-index, where the plugin is not listed yet.
 
 Under `helm unstick`, Helm consumes `-n`, `--kube-context` and `--kubeconfig` itself and passes them on as `HELM_NAMESPACE`, `HELM_KUBECONTEXT` and `KUBECONFIG` (checked with Helm 4.3.0). `helm-unstick` reads all three, so the flags work the same way in every mode.
 
